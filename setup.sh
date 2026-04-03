@@ -780,21 +780,73 @@ discover_env_vars() {
 # DOCKERFILE GENERATOR
 # ═════════════════════════════════════════════════════════════════════════════
 
+generate_entrypoint() {
+  local outfile="$1" start_cmd="$2" port="$3"
+  cat > "$outfile" <<'ENTRYEOF'
+#!/bin/sh
+set -e
+
+# ── vox entrypoint: cloudflared + app in one container ──
+
+cleanup() {
+  echo "[vox] shutting down..."
+  kill "$CF_PID" "$APP_PID" 2>/dev/null || true
+  wait "$CF_PID" "$APP_PID" 2>/dev/null || true
+  exit 0
+}
+trap cleanup SIGTERM SIGINT
+
+# ── Start cloudflared tunnel inside the container ──
+if [ -n "${TUNNEL_TOKEN:-}" ]; then
+  echo "[vox] starting cloudflared tunnel (token mode)..."
+  cloudflared tunnel run --token "$TUNNEL_TOKEN" &
+  CF_PID=$!
+elif [ -f /etc/cloudflared/credentials.json ]; then
+  echo "[vox] starting cloudflared tunnel (credentials mode)..."
+  cloudflared tunnel --config /etc/cloudflared/config.yml run &
+  CF_PID=$!
+else
+  echo "[vox] WARNING: no TUNNEL_TOKEN or credentials found — tunnel disabled"
+  CF_PID=""
+fi
+
+# ── Start the application ──
+ENTRYEOF
+
+  # Write the app start command
+  cat >> "$outfile" <<STARTEOF
+echo "[vox] starting app on port ${port}..."
+${start_cmd} &
+APP_PID=\$!
+
+echo "[vox] running — app=\$APP_PID tunnel=\${CF_PID:-none}"
+wait -n 2>/dev/null || wait \$APP_PID
+STARTEOF
+
+  chmod +x "$outfile"
+}
+
 generate_dockerfile() {
   local repo="$1" outfile="$2"
 
-  # Static sites get a special nginx Dockerfile
+  # ── All Dockerfiles include cloudflared inside the image ──
+  # This means every container is fully self-contained: app + tunnel.
+
+  # Static sites — nginx + cloudflared
   if [[ "$DETECTED_TYPE" == "static" ]]; then
     cat > "$outfile" <<'STATICEOF'
 FROM nginx:alpine
+RUN apk add --no-cache cloudflared
 COPY . /usr/share/nginx/html
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
 STATICEOF
+    generate_entrypoint "$repo/entrypoint.sh" "nginx -g 'daemon off;'" "$DETECTED_PORT"
     return 0
   fi
 
-  # Go gets a multi-stage build
+  # Go — multi-stage build + cloudflared in final stage
   if [[ "$DETECTED_TYPE" == "go" ]]; then
     cat > "$outfile" <<GOEOF
 FROM golang:1.22-alpine AS builder
@@ -805,16 +857,18 @@ COPY . .
 RUN ${DETECTED_BUILD_CMD}
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates cloudflared
 WORKDIR /app
 COPY --from=builder /app/server .
-EXPOSE ${DETECTED_PORT}
-CMD ["${DETECTED_START_CMD}"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
 GOEOF
+    generate_entrypoint "$repo/entrypoint.sh" "${DETECTED_START_CMD}" "$DETECTED_PORT"
     return 0
   fi
 
-  # Rust gets a multi-stage build
+  # Rust — multi-stage build + cloudflared in final stage
   if [[ "$DETECTED_TYPE" == "rust" ]]; then
     cat > "$outfile" <<RUSTEOF
 FROM rust:1.77-slim AS builder
@@ -825,19 +879,40 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main" > /etc/apt/sources.list.d/cloudflared.list && \
+    apt-get update && apt-get install -y --no-install-recommends cloudflared && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /src/target/release/* ./
-EXPOSE ${DETECTED_PORT}
-CMD ["${DETECTED_START_CMD}"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
 RUSTEOF
+    generate_entrypoint "$repo/entrypoint.sh" "${DETECTED_START_CMD}" "$DETECTED_PORT"
     return 0
   fi
 
-  # Generic Dockerfile for everything else
+  # ── Generic Dockerfile (Node, Python, Ruby, PHP, etc.) ──
   local is_node=0
   if [[ "$DETECTED_TYPE" == node/* ]] || [[ "$DETECTED_TYPE" == "node" ]]; then
     is_node=1
+  fi
+
+  # Determine how to install cloudflared based on base image
+  local cf_install=""
+  if echo "$DETECTED_BASE_IMAGE" | grep -q "alpine"; then
+    cf_install="RUN apk add --no-cache cloudflared"
+  elif echo "$DETECTED_BASE_IMAGE" | grep -q "slim\|debian\|ubuntu"; then
+    cf_install='RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg && \
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(grep VERSION_CODENAME /etc/os-release | cut -d= -f2) main" > /etc/apt/sources.list.d/cloudflared.list && \
+    apt-get update && apt-get install -y --no-install-recommends cloudflared && \
+    rm -rf /var/lib/apt/lists/*'
+  else
+    # Fallback: download static binary
+    cf_install='RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared'
   fi
 
   {
@@ -849,6 +924,11 @@ RUSTEOF
       echo -e "$DETECTED_SYSTEM_DEPS"
       echo ""
     fi
+
+    # Install cloudflared inside the image
+    echo "# Cloudflare tunnel daemon — runs inside the container"
+    echo "$cf_install"
+    echo ""
 
     echo "WORKDIR /app"
     echo ""
@@ -868,7 +948,7 @@ RUSTEOF
     echo "COPY . ."
     echo ""
 
-    # ── Post-copy: rebuild native modules now that source is present ──
+    # ── Post-copy: rebuild native modules ──
     if [[ "$is_node" -eq 1 ]] && [[ -n "${DETECTED_NATIVE_MODULES:-}" ]]; then
       echo "# Rebuild native modules against source tree"
       echo "RUN npm rebuild ${DETECTED_NATIVE_MODULES}"
@@ -889,14 +969,14 @@ RUSTEOF
       echo ""
     fi
 
-    echo "EXPOSE ${DETECTED_PORT}"
-    echo ""
-
-    # Start command
-    if [[ -n "$DETECTED_START_CMD" ]]; then
-      echo "CMD ${DETECTED_START_CMD}"
-    fi
+    # Entrypoint — manages both cloudflared + app
+    echo "COPY entrypoint.sh /entrypoint.sh"
+    echo "RUN chmod +x /entrypoint.sh"
+    echo "ENTRYPOINT [\"/entrypoint.sh\"]"
   } > "$outfile"
+
+  # Generate the entrypoint script
+  generate_entrypoint "$repo/entrypoint.sh" "${DETECTED_START_CMD}" "$DETECTED_PORT"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -908,6 +988,8 @@ generate_compose() {
   local container_name
   container_name=$(echo "$repo_dir" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
 
+  # ── Single container: app + cloudflared tunnel, fully isolated ──
+
   local volume_block=""
   local volume_def=""
   if [[ -n "$DETECTED_DATA_DIRS" ]]; then
@@ -918,41 +1000,36 @@ generate_compose() {
     done
   fi
 
-  # Healthcheck — try common health endpoints, fall back to TCP check
   local hc_cmd
   hc_cmd="[\"CMD\", \"sh\", \"-c\", \"wget -qO- http://localhost:${DETECTED_PORT}/ || exit 1\"]"
 
   {
     cat <<COMPHEAD
-# Generated by vox setup.sh — $(date -Iseconds)
+# Generated by vox — $(date -Iseconds)
+# Single container: app + cloudflared tunnel (fully isolated from host)
 
 services:
-  app:
-COMPHEAD
-
-    # Build context: use existing Dockerfile or generated one
-    if [[ "$DETECTED_HAS_DOCKERFILE" == "true" ]] && [[ "$USE_EXISTING_DOCKERFILE" == "true" ]]; then
-      echo "    build: ./${repo_dir}"
-    else
-      cat <<COMPBUILD
+  ${container_name}:
     build:
       context: ./${repo_dir}
       dockerfile: Dockerfile
-COMPBUILD
-    fi
-
-    cat <<COMPCORE
-    container_name: ${container_name}-app
+    container_name: ${container_name}
     restart: unless-stopped
     env_file: ./${repo_dir}/.env
-    expose:
-      - "${DETECTED_PORT}"
-COMPCORE
+COMPHEAD
 
     # Volumes
     if [[ -n "$volume_block" ]]; then
       echo "    volumes:"
       echo -e "$volume_block" | sed '/^$/d'
+    fi
+
+    # Credentials file mount (only for non-token auth)
+    if [[ -z "$CF_TUNNEL_TOKEN" ]] && [[ -n "${CF_CREDENTIALS_FILE:-}" ]]; then
+      if [[ -z "$volume_block" ]]; then
+        echo "    volumes:"
+      fi
+      echo "      - ./.cloudflared:/etc/cloudflared:ro"
     fi
 
     cat <<COMPHC
@@ -964,34 +1041,9 @@ COMPCORE
       start_period: 40s
 COMPHC
 
-    # Tunnel service
-    echo ""
-    if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
-      cat <<COMPTUNNEL
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    container_name: ${container_name}-tunnel
-    restart: unless-stopped
-    command: tunnel run
-    env_file: ./${repo_dir}/.env
-    depends_on:
-      app:
-        condition: service_healthy
-COMPTUNNEL
-    else
-      cat <<COMPTUNNEL2
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    container_name: ${container_name}-tunnel
-    restart: unless-stopped
-    command: tunnel --config /etc/cloudflared/config.yml run
-    volumes:
-      - ./.cloudflared:/etc/cloudflared:ro
-    depends_on:
-      app:
-        condition: service_healthy
-COMPTUNNEL2
-    fi
+    # No ports exposed to host — tunnel handles all traffic
+    echo "    # No ports exposed — all traffic routed through Cloudflare Tunnel"
+    echo "    network_mode: bridge"
 
     # Volume definitions
     if [[ -n "$volume_def" ]]; then
@@ -1473,13 +1525,16 @@ CFGEOF
 
   # ── Summary ──
   echo ""
-  box_line "Generated files:"
+  box_line "Architecture: SINGLE CONTAINER (app + cloudflared tunnel)"
+  box_line "Each project is fully isolated — no host-level tunnel config."
   box_line ""
+  box_line "Generated files:"
   box_line "  $WORK_DIR/"
   box_line "    docker-compose.yml"
   box_line "    $REPO_DIR/.env"
   if [[ "$USE_EXISTING_DOCKERFILE" != "true" ]]; then
     box_line "    $REPO_DIR/Dockerfile"
+    box_line "    $REPO_DIR/entrypoint.sh"
   fi
   box_line "    $REPO_DIR/.dockerignore"
   [[ -n "$CF_CREDS_DEST" ]] && box_line "    .cloudflared/config.yml"
@@ -1505,8 +1560,9 @@ CFGEOF
     echo ""
     banner "Live"
 
-    box_line "Internal: port ${DETECTED_PORT} (not exposed to host)"
-    box_line "Public:   https://${CF_HOSTNAME} (via Cloudflare Tunnel)"
+    box_line "Single container running: app + cloudflared tunnel"
+    box_line "Public: https://${CF_HOSTNAME} (tunnel from inside container)"
+    box_line "No ports exposed to host — fully isolated"
     box_line ""
     box_line "Commands:"
     box_line "  ./vox logs --follow   # follow logs"
@@ -1551,7 +1607,7 @@ cmd_deploy() {
   local rollback_tag="${CFG_REPO_DIR}:rollback-${ts}"
   local container_name
   container_name=$(echo "$CFG_REPO_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
-  local app_container="${container_name}-app"
+  local app_container="${container_name}"
 
   local current_image
   current_image=$(docker inspect --format='{{.Image}}' "$app_container" 2>/dev/null || true)
@@ -1621,23 +1677,17 @@ cmd_status() {
 
   local container_name
   container_name=$(echo "$CFG_REPO_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
-  local app_container="${container_name}-app"
-  local tunnel_container="${container_name}-tunnel"
+  local ctr="${container_name}"
 
-  local app_status="not running"
-  local app_health="n/a"
-  local app_uptime=""
-  local app_image=""
-  if docker inspect "$app_container" &>/dev/null 2>&1; then
-    app_status=$(docker inspect --format='{{.State.Status}}' "$app_container" 2>/dev/null || echo "unknown")
-    app_health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' "$app_container" 2>/dev/null || echo "n/a")
-    app_uptime=$(docker inspect --format='{{.State.StartedAt}}' "$app_container" 2>/dev/null || true)
-    app_image=$(docker inspect --format='{{.Config.Image}}' "$app_container" 2>/dev/null || true)
-  fi
-
-  local tunnel_status="not running"
-  if docker inspect "$tunnel_container" &>/dev/null 2>&1; then
-    tunnel_status=$(docker inspect --format='{{.State.Status}}' "$tunnel_container" 2>/dev/null || echo "unknown")
+  local ctr_status="not running"
+  local ctr_health="n/a"
+  local ctr_uptime=""
+  local ctr_image=""
+  if docker inspect "$ctr" &>/dev/null 2>&1; then
+    ctr_status=$(docker inspect --format='{{.State.Status}}' "$ctr" 2>/dev/null || echo "unknown")
+    ctr_health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' "$ctr" 2>/dev/null || echo "n/a")
+    ctr_uptime=$(docker inspect --format='{{.State.StartedAt}}' "$ctr" 2>/dev/null || true)
+    ctr_image=$(docker inspect --format='{{.Config.Image}}' "$ctr" 2>/dev/null || true)
   fi
 
   # Find last deploy
@@ -1655,17 +1705,17 @@ print(d.get('timestamp','') + ' [' + d.get('status','') + ']')
   fi
 
   banner "vox status"
-  box_line "Project:    $CFG_PROJECT_NAME"
-  box_line "Type:       $CFG_TYPE"
-  box_line "Hostname:   $CFG_HOSTNAME"
+  box_line "Project:      $CFG_PROJECT_NAME"
+  box_line "Type:         $CFG_TYPE"
+  box_line "Hostname:     https://$CFG_HOSTNAME"
   box_line ""
-  box_line "app:        $app_status  (health: $app_health)"
-  box_line "tunnel:     $tunnel_status"
+  box_line "Container:    $ctr_status  (health: $ctr_health)"
+  box_line "  app + cloudflared tunnel running inside single container"
   box_line ""
-  box_line "Image:      ${app_image:-(none)}"
-  box_line "Git SHA:    ${git_sha:-(unknown)}"
-  box_line "Started:    ${app_uptime:-(not running)}"
-  box_line "Last deploy:${last_deploy:-(none)}"
+  box_line "Image:        ${ctr_image:-(none)}"
+  box_line "Git SHA:      ${git_sha:-(unknown)}"
+  box_line "Started:      ${ctr_uptime:-(not running)}"
+  box_line "Last deploy:  ${last_deploy:-(none)}"
   box_render
 }
 
