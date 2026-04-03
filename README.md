@@ -2,9 +2,9 @@
 
 Deploy any git repo to your own server with a Cloudflare Tunnel — one command, one container, fully isolated.
 
-```
+```bash
 curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/vox -o vox && chmod +x vox
-./vox setup
+./vox setup --repo https://github.com/you/app --token eyJ... --hostname app.example.com
 ```
 
 ## What You Need
@@ -17,26 +17,47 @@ That's it. The script auto-detects your stack, builds a Docker image with your a
 
 ## Quick Start
 
-```bash
-# Download
-curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/vox -o vox
-chmod +x vox
-
-# Deploy (interactive — walks you through everything)
-./vox setup
-```
-
-The setup wizard asks for:
-- Git repo URL
-- Cloudflare Tunnel token
-- (Optional) environment variables
-
-If your repo has a `.env.example`, it reads the keys and prompts you for values. Or drag-and-drop a `.env` file:
+### One-liner (no prompts)
 
 ```bash
-# Import env vars from a file
-./vox setup /path/to/your/.env
+# Download + deploy in one shot
+curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/vox -o vox && chmod +x vox
+
+./vox setup \
+  --repo https://github.com/you/your-app \
+  --token eyJhIjoiNjQ1... \
+  --hostname app.example.com
 ```
+
+With env file and custom branch:
+
+```bash
+./vox setup \
+  --repo https://github.com/you/your-app \
+  --token eyJhIjoiNjQ1... \
+  --hostname app.example.com \
+  --env /path/to/.env \
+  --branch develop
+```
+
+### Interactive mode
+
+```bash
+./vox setup              # prompts for everything
+./vox setup my-app.env   # prompts but imports env vars from file
+```
+
+### Flags
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--repo URL` | Yes* | Git repo URL |
+| `--token TOKEN` | Yes* | Cloudflare Tunnel token |
+| `--hostname DOMAIN` | Yes* | Public hostname (e.g. `app.example.com`) |
+| `--env PATH` | No | Path to `.env` file |
+| `--branch BRANCH` | No | Git branch (default: `main`) |
+
+*When all three required flags are provided, setup runs fully non-interactive — no prompts, straight to build and deploy.
 
 ## How It Works
 
