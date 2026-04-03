@@ -1237,6 +1237,7 @@ cmd_setup() {
   CLI_TOKEN=""
   CLI_HOSTNAME=""
   CLI_BRANCH=""
+  CLI_AUTOPULL="true"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1246,6 +1247,7 @@ cmd_setup() {
       --domain)   CLI_HOSTNAME="$2"; shift 2 ;;  # alias
       --env)      IMPORTED_ENV_FILE="$2"; shift 2 ;;
       --branch)   CLI_BRANCH="$2"; shift 2 ;;
+      --autopull) CLI_AUTOPULL="$2"; shift 2 ;;
       *)
         # Bare arg — check if it's a file (drag-and-drop .env)
         local cleaned
@@ -1662,6 +1664,13 @@ CFGEOF
     echo "    ./vox deploy"
   fi
 
+  # ── Auto-start watcher (default on, disable with --autopull false) ──
+  if [[ "$CLI_AUTOPULL" == "true" ]]; then
+    info "Starting autopull watcher (monitors repo for changes)..."
+    cmd_watch start
+    info "Disable with: ./vox watch stop  |  Skip at setup: --autopull false"
+  fi
+
   banner "Done"
 }
 
@@ -2058,7 +2067,100 @@ PYEOF
 # SUBCOMMAND: watch
 # ═════════════════════════════════════════════════════════════════════════════
 
+deploy_with_rollback() {
+  # Deploy and auto-rollback to previous image on failure.
+  # Used by the watch loop for safe unattended deploys.
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  COMPOSE_CMD="${CFG_COMPOSE_CMD:-docker compose}"
+
+  local container_name
+  container_name=$(echo "$CFG_REPO_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
+
+  # Save current state for rollback
+  local pre_sha=""
+  pre_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+  local pre_image=""
+  pre_image=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || true)
+  local rollback_tag="${CFG_REPO_DIR}:rollback-$(date +%Y%m%d%H%M%S)"
+  if [[ -n "$pre_image" ]]; then
+    docker tag "$pre_image" "$rollback_tag" 2>/dev/null || true
+  fi
+
+  # Pull
+  info "Pulling latest from $CFG_REPO_BRANCH..."
+  if ! git -C "$REPO_PATH" pull origin "$CFG_REPO_BRANCH" 2>/dev/null; then
+    warn "Git pull failed — aborting deploy, keeping current version."
+    return 1
+  fi
+
+  local post_sha=""
+  post_sha=$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null || true)
+
+  # Build
+  info "Building ($post_sha)..."
+  if ! $COMPOSE_CMD build 2>/dev/null; then
+    warn "Build failed — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" 2>/dev/null || true
+    vox_log_deploy "build-failed" "$rollback_tag"
+    return 1
+  fi
+
+  # Restart
+  $COMPOSE_CMD up -d 2>/dev/null
+
+  # Healthcheck
+  if wait_for_health "$container_name" 120; then
+    vox_log_deploy "success" "$rollback_tag"
+    info "Deploy successful ($post_sha) — https://$CFG_HOSTNAME"
+    return 0
+  else
+    # Healthcheck failed — rollback
+    warn "Healthcheck failed — rolling back..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" 2>/dev/null || true
+    $COMPOSE_CMD build 2>/dev/null || true
+    $COMPOSE_CMD up -d 2>/dev/null || true
+    vox_log_deploy "rollback" "$rollback_tag"
+    warn "Rolled back to $pre_sha"
+    return 1
+  fi
+}
+
 cmd_watch() {
+  local subcmd="${1:-start}"
+
+  case "$subcmd" in
+    stop)
+      local pidfile="$VOX_DIR/watch.pid"
+      if [[ -f "$pidfile" ]]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+          kill "$pid" 2>/dev/null || true
+          rm -f "$pidfile"
+          info "Watcher stopped (PID $pid)."
+        else
+          rm -f "$pidfile"
+          info "Watcher was not running (stale PID)."
+        fi
+      else
+        info "No watcher running."
+      fi
+      return 0
+      ;;
+    status)
+      local pidfile="$VOX_DIR/watch.pid"
+      if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        info "Watcher running (PID $(cat "$pidfile"))."
+      else
+        info "Watcher not running."
+      fi
+      return 0
+      ;;
+  esac
+
+  # ── Start the watch loop ──
   vox_load_config
   WORK_DIR="$(pwd)"
   REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
@@ -2066,32 +2168,50 @@ cmd_watch() {
   local interval="${VOX_WATCH_INTERVAL:-60}"
   local pidfile="$VOX_DIR/watch.pid"
 
-  info "Starting watch loop (interval: ${interval}s, PID will be written to $pidfile)"
-  info "Press Ctrl+C to stop."
-  echo "$$" > "$pidfile"
+  # Check for existing watcher
+  if [[ -f "$pidfile" ]]; then
+    local existing_pid
+    existing_pid=$(cat "$pidfile")
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      info "Watcher already running (PID $existing_pid). Use './vox watch stop' to stop it."
+      return 0
+    fi
+    rm -f "$pidfile"
+  fi
 
-  while true; do
-    local ts
-    ts=$(date -Iseconds)
+  info "Starting autopull watcher (interval: ${interval}s)"
+  info "Deploys automatically on new commits. Rolls back on failure."
+  info "Stop with: ./vox watch stop"
 
-    if [[ -d "$REPO_PATH/.git" ]]; then
-      git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || true
+  # Run in background
+  (
+    echo "$$" > "$pidfile"
+    trap 'rm -f "$pidfile"; exit 0' SIGTERM SIGINT
+
+    while true; do
+      sleep "$interval"
+
+      if [[ ! -d "$REPO_PATH/.git" ]]; then
+        continue
+      fi
+
+      # Fetch and compare
+      git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || continue
       local local_sha remote_sha
       local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
       remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
 
       if [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
-        info "[$ts] New commits detected — deploying..."
-        cmd_deploy
-      else
-        info "[$ts] No changes (${local_sha:0:8})."
+        local behind
+        behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
+        info "[autopull] $behind new commit(s) detected — deploying..."
+        deploy_with_rollback || warn "[autopull] Deploy failed, rolled back."
       fi
-    else
-      warn "[$ts] Repo not found at $REPO_PATH — skipping check."
-    fi
+    done
+  ) &
 
-    sleep "$interval"
-  done
+  disown
+  info "Watcher started in background (PID $!)."
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2112,6 +2232,16 @@ cmd_destroy() {
   if ! confirm "Are you SURE you want to destroy everything?"; then
     info "Aborted."
     return 0
+  fi
+
+  # Kill watcher if running
+  local pidfile="$VOX_DIR/watch.pid"
+  if [[ -f "$pidfile" ]]; then
+    local wpid
+    wpid=$(cat "$pidfile")
+    kill "$wpid" 2>/dev/null || true
+    rm -f "$pidfile"
+    info "Stopped autopull watcher."
   fi
 
   cd "$WORK_DIR"
@@ -2174,7 +2304,9 @@ cmd_help() {
   box_line "  env set KEY=VALUE   Add/update an env var and redeploy"
   box_line "  env unset KEY       Remove an env var and redeploy"
   box_line "  history             Show last 20 deploys"
-  box_line "  watch               Poll git every 60s and auto-deploy on changes"
+  box_line "  watch               Start autopull watcher (on by default after setup)"
+  box_line "  watch stop          Stop the autopull watcher"
+  box_line "  watch status        Check if watcher is running"
   box_line "  destroy             Tear down everything (confirms first)"
   box_line "  help                Show this message"
   box_line ""
@@ -2185,6 +2317,7 @@ cmd_help() {
   box_line "  --domain DOMAIN     Alias for --hostname"
   box_line "  --env PATH          Path to .env file"
   box_line "  --branch BRANCH     Git branch (default: main)"
+  box_line "  --autopull false    Disable auto-redeploy watcher"
   box_render
 }
 
