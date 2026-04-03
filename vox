@@ -302,8 +302,11 @@ print(f'main:{d.get(\"main\", \"\")}')
     # instead of "npm run build" which triggers prebuild → death
     resolve_build_cmd() {
       if [[ "$has_dangerous_prebuild" -eq 1 ]] && [[ -n "$pkg_build_script" ]]; then
-        # Run the underlying command directly, skip lifecycle
-        echo "npx $pkg_build_script"
+        if echo "$pkg_build_script" | grep -qE '^(node|python|ruby|php|java|go|./|/)'; then
+          echo "$pkg_build_script"
+        else
+          echo "npx $pkg_build_script"
+        fi
       elif [[ -n "$pkg_build_script" ]]; then
         echo "${pkg_mgr} run build"
       else
@@ -315,7 +318,13 @@ print(f'main:{d.get(\"main\", \"\")}')
     # Same logic: if prestart is dangerous, use the raw command
     resolve_start_cmd() {
       if [[ "$has_dangerous_prestart" -eq 1 ]] && [[ -n "$pkg_start_script" ]]; then
-        echo "npx $pkg_start_script"
+        # Run raw command directly, bypassing prestart lifecycle
+        # Don't prepend npx if already starts with node/python/etc
+        if echo "$pkg_start_script" | grep -qE '^(node|python|ruby|php|java|go|./|/)'; then
+          echo "$pkg_start_script"
+        else
+          echo "npx $pkg_start_script"
+        fi
       elif [[ -n "$pkg_start_script" ]]; then
         echo "${pkg_mgr} start"
       else
@@ -805,7 +814,7 @@ cleanup() {
   wait "$CF_PID" "$APP_PID" 2>/dev/null || true
   exit 0
 }
-trap cleanup SIGTERM SIGINT
+trap cleanup TERM INT
 
 # ── Start cloudflared tunnel inside the container ──
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
@@ -1020,7 +1029,7 @@ generate_compose() {
   fi
 
   local hc_cmd
-  hc_cmd="[\"CMD\", \"sh\", \"-c\", \"wget -qO- http://localhost:${DETECTED_PORT}/ || exit 1\"]"
+  hc_cmd="[\"CMD\", \"sh\", \"-c\", \"curl -sf http://localhost:${DETECTED_PORT}/ > /dev/null || wget -qO- http://localhost:${DETECTED_PORT}/ > /dev/null || exit 1\"]"
 
   {
     cat <<COMPHEAD
@@ -1057,7 +1066,7 @@ COMPHEAD
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 90s
     # GPU passthrough — all available GPUs exposed to container
     deploy:
       resources:
