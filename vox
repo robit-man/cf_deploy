@@ -186,6 +186,12 @@ detect_project() {
   if [[ -f "$repo/package.json" ]]; then
     DETECTED_TYPE="node"
     DETECTED_BASE_IMAGE="node:20-alpine"
+    # If repo has Python files (transcription sidecar, ML, etc.), use Debian slim
+    # Alpine's musl breaks numpy/scipy/whisper pip wheels
+    if compgen -G "$repo/*.py" > /dev/null 2>&1 || [[ -f "$repo/requirements.txt" ]] || [[ -f "$repo/Pipfile" ]]; then
+      DETECTED_BASE_IMAGE="node:20-slim"
+      detect "Python files detected — using node:20-slim (glibc) instead of alpine (musl)"
+    fi
     DETECTED_COPY_DEPS="package.json package-lock.json* yarn.lock* pnpm-lock.yaml*"
     DETECTED_IGNORE_PATTERNS="node_modules\n.next\n.nuxt\ndist\nbuild\n.env.local\n.git"
 
@@ -246,7 +252,11 @@ print(f'main:{d.get(\"main\", \"\")}')
       fi
     done
     if [[ "$has_native" -eq 1 ]]; then
-      DETECTED_SYSTEM_DEPS="${DETECTED_SYSTEM_DEPS:+$DETECTED_SYSTEM_DEPS\n}RUN apk add --no-cache python3 make g++ gcc musl-dev"
+      if echo "$DETECTED_BASE_IMAGE" | grep -q "alpine"; then
+        DETECTED_SYSTEM_DEPS="${DETECTED_SYSTEM_DEPS:+$DETECTED_SYSTEM_DEPS\n}RUN apk add --no-cache python3 make g++ gcc musl-dev"
+      else
+        DETECTED_SYSTEM_DEPS="${DETECTED_SYSTEM_DEPS:+$DETECTED_SYSTEM_DEPS\n}RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pip make g++ gcc && rm -rf /var/lib/apt/lists/*"
+      fi
       detect "Native modules detected ($native_modules) — adding build tools"
     fi
     # Store for Dockerfile generator
@@ -980,6 +990,17 @@ RUSTEOF
     if [[ "$is_node" -eq 1 ]] && [[ -n "${DETECTED_NATIVE_MODULES:-}" ]]; then
       echo "# Rebuild native modules against source tree"
       echo "RUN npm rebuild ${DETECTED_NATIVE_MODULES}"
+      echo ""
+    fi
+
+    # ── Python sidecar (transcription, ML, etc.) ──
+    if compgen -G "$repo/*.py" > /dev/null 2>&1; then
+      echo "# Python sidecar dependencies"
+      echo "RUN python3 -m venv /app/.venv && \\"
+      echo "    /app/.venv/bin/pip install --no-cache-dir numpy 2>/dev/null && \\"
+      echo "    /app/.venv/bin/pip install --no-cache-dir faster-whisper 2>/dev/null || \\"
+      echo "    /app/.venv/bin/pip install --no-cache-dir openai-whisper 2>/dev/null || \\"
+      echo '    echo "[vox] No whisper backend installed — transcription unavailable"'
       echo ""
     fi
 
