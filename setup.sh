@@ -836,7 +836,9 @@ generate_dockerfile() {
   if [[ "$DETECTED_TYPE" == "static" ]]; then
     cat > "$outfile" <<'STATICEOF'
 FROM nginx:alpine
-RUN apk add --no-cache cloudflared
+RUN apk add --no-cache curl && \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared
 COPY . /usr/share/nginx/html
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -857,7 +859,9 @@ COPY . .
 RUN ${DETECTED_BUILD_CMD}
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates cloudflared
+RUN apk add --no-cache ca-certificates curl && \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared
 WORKDIR /app
 COPY --from=builder /app/server .
 COPY entrypoint.sh /entrypoint.sh
@@ -880,9 +884,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && \
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main" > /etc/apt/sources.list.d/cloudflared.list && \
-    apt-get update && apt-get install -y --no-install-recommends cloudflared && \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /src/target/release/* ./
@@ -903,15 +906,16 @@ RUSTEOF
   # Determine how to install cloudflared based on base image
   local cf_install=""
   if echo "$DETECTED_BASE_IMAGE" | grep -q "alpine"; then
-    cf_install="RUN apk add --no-cache cloudflared"
+    cf_install='RUN apk add --no-cache curl && \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared'
   elif echo "$DETECTED_BASE_IMAGE" | grep -q "slim\|debian\|ubuntu"; then
-    cf_install='RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg && \
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && \
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(grep VERSION_CODENAME /etc/os-release | cut -d= -f2) main" > /etc/apt/sources.list.d/cloudflared.list && \
-    apt-get update && apt-get install -y --no-install-recommends cloudflared && \
+    cf_install='RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared && \
     rm -rf /var/lib/apt/lists/*'
   else
-    # Fallback: download static binary
+    # Fallback: download static binary (works on any Linux)
     cf_install='RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared'
   fi
 
