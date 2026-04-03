@@ -2107,9 +2107,10 @@ cmd_destroy() {
   vox_load_config
   WORK_DIR="$(pwd)"
   REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  COMPOSE_CMD="${CFG_COMPOSE_CMD:-docker compose}"
 
   echo ""
-  warn "This will stop and remove all containers, images, volumes, and vox state."
+  warn "This will stop and remove ALL vox-generated files from this directory."
   warn "Project: $CFG_PROJECT_NAME  |  Repo: $REPO_PATH"
   echo ""
 
@@ -2119,20 +2120,39 @@ cmd_destroy() {
   fi
 
   cd "$WORK_DIR"
+
+  # 1. Stop and remove containers, volumes, images
   info "Taking down containers, volumes, and local images..."
   $COMPOSE_CMD down --volumes --rmi local 2>/dev/null || true
 
-  info "Removing .vox/ state directory..."
+  # 2. Remove generated files inside the repo
+  if [[ -d "$REPO_PATH" ]]; then
+    info "Removing generated files from $CFG_REPO_DIR/..."
+    rm -f "$REPO_PATH/Dockerfile"
+    rm -f "$REPO_PATH/entrypoint.sh"
+    rm -f "$REPO_PATH/.dockerignore"
+    rm -f "$REPO_PATH/.env"
+  fi
+
+  # 3. Remove docker-compose.yml from working dir
+  rm -f "$WORK_DIR/docker-compose.yml"
+
+  # 4. Remove .cloudflared/ if present
+  rm -rf "$WORK_DIR/.cloudflared"
+
+  # 5. Remove .vox/ state
+  info "Removing .vox/ state..."
   rm -rf "$VOX_DIR"
 
+  # 6. Optionally remove the cloned repo itself
   if [[ -d "$REPO_PATH" ]]; then
-    if confirm "Also remove the cloned repo at $REPO_PATH?"; then
+    if confirm "Also delete the cloned repo at $REPO_PATH?"; then
       rm -rf "$REPO_PATH"
       info "Removed $REPO_PATH"
     fi
   fi
 
-  info "Destroy complete."
+  info "Destroy complete. Directory is clean."
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
