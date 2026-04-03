@@ -680,7 +680,7 @@ discover_env_vars() {
     done
     echo ""
 
-    if confirm "Edit any of these values?"; then
+    if [[ "$AUTO_MODE" != "true" ]] && confirm "Edit any of these values?"; then
       ENV_VARS=()
       while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -706,6 +706,12 @@ discover_env_vars() {
   fi
 
   # ── Option B: No import — check for env example in repo, or ask manually ──
+
+  # In auto mode, skip all interactive env prompts
+  if [[ "$AUTO_MODE" == "true" ]]; then
+    info "No .env file provided via --env. Continuing without app env vars."
+    return 0
+  fi
 
   # Also prompt: drag/drop an env file now
   echo ""
