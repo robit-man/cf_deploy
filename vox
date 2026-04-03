@@ -1452,18 +1452,18 @@ cmd_setup() {
   # ─────────────────────────────────────────────────────────────────────────
   banner "Step 3 / 5 — Cloudflare Tunnel"
 
-  CF_TUNNEL_TOKEN=""
+  CF_TUNNEL_TOKEN="${CLI_TOKEN:-}"
+  CF_HOSTNAME="${CLI_HOSTNAME:-}"
   CF_TUNNEL_ID=""
   CF_CREDENTIALS_FILE=""
+  CF_AUTH_METHOD="1"
 
-  if [[ -n "$CLI_TOKEN" ]] && [[ -n "$CLI_HOSTNAME" ]]; then
-    # Non-interactive — flags provided
-    CF_TUNNEL_TOKEN="$CLI_TOKEN"
-    CF_HOSTNAME="$CLI_HOSTNAME"
-    CF_AUTH_METHOD="1"
+  # ── Already have token + hostname from flags? Skip all prompts ──
+  if [[ -n "$CF_TUNNEL_TOKEN" ]] && [[ -n "$CF_HOSTNAME" ]]; then
     info "Hostname: $CF_HOSTNAME"
     info "Tunnel token: provided via --token"
   else
+    # ── Interactive tunnel setup ──
     box_line "Expose your app on a domain you control — no open ports needed."
     box_line "You'll need a tunnel token from the Cloudflare Zero Trust dashboard."
     box_line ""
@@ -1473,30 +1473,32 @@ cmd_setup() {
     box_render
     echo ""
 
-    ask CF_HOSTNAME "Public hostname (e.g. app.example.com)" ""
+    if [[ -z "$CF_HOSTNAME" ]]; then
+      ask CF_HOSTNAME "Public hostname (e.g. app.example.com)" ""
+    fi
     echo ""
     ask CF_AUTH_METHOD "Auth method [1/2]" "1"
-  fi
 
-  if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
-    :
-  elif [[ "$CF_AUTH_METHOD" == "1" ]]; then
-    ask_secret CF_TUNNEL_TOKEN "Cloudflare Tunnel token" ""
-    if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
-      err "Tunnel token is required."
-      exit 1
+    if [[ "$CF_AUTH_METHOD" == "1" ]]; then
+      if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
+        ask_secret CF_TUNNEL_TOKEN "Cloudflare Tunnel token" ""
+      fi
+      if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
+        err "Tunnel token is required."
+        exit 1
+      fi
+    else
+      ask CF_CREDENTIALS_FILE "Path to tunnel credentials JSON" ""
+      if [[ ! -f "$CF_CREDENTIALS_FILE" ]]; then
+        err "File not found: $CF_CREDENTIALS_FILE"
+        exit 1
+      fi
+      CF_TUNNEL_ID=$(python3 -c "import json; print(json.load(open('$CF_CREDENTIALS_FILE'))['TunnelID'])" 2>/dev/null || true)
+      if [[ -z "$CF_TUNNEL_ID" ]]; then
+        ask CF_TUNNEL_ID "Tunnel ID (UUID)" ""
+      fi
+      info "Tunnel ID: $CF_TUNNEL_ID"
     fi
-  else
-    ask CF_CREDENTIALS_FILE "Path to tunnel credentials JSON" ""
-    if [[ ! -f "$CF_CREDENTIALS_FILE" ]]; then
-      err "File not found: $CF_CREDENTIALS_FILE"
-      exit 1
-    fi
-    CF_TUNNEL_ID=$(python3 -c "import json; print(json.load(open('$CF_CREDENTIALS_FILE'))['TunnelID'])" 2>/dev/null || true)
-    if [[ -z "$CF_TUNNEL_ID" ]]; then
-      ask CF_TUNNEL_ID "Tunnel ID (UUID)" ""
-    fi
-    info "Tunnel ID: $CF_TUNNEL_ID"
   fi
 
   # ─────────────────────────────────────────────────────────────────────────
