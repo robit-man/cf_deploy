@@ -1478,7 +1478,9 @@ cmd_setup() {
     ask CF_AUTH_METHOD "Auth method [1/2]" "1"
   fi
 
-  if [[ -z "$CF_TUNNEL_TOKEN" ]] && [[ "$CF_AUTH_METHOD" == "1" ]]; then
+  if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
+    :
+  elif [[ "$CF_AUTH_METHOD" == "1" ]]; then
     ask_secret CF_TUNNEL_TOKEN "Cloudflare Tunnel token" ""
     if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
       err "Tunnel token is required."
