@@ -3,7 +3,7 @@
 Deploy any git repo to your own server with a Cloudflare Tunnel — one command, one container, fully isolated.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/setup.sh -o vox && chmod +x vox
+curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/vox -o vox && chmod +x vox
 ./vox setup
 ```
 
@@ -19,7 +19,7 @@ That's it. The script auto-detects your stack, builds a Docker image with your a
 
 ```bash
 # Download
-curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/setup.sh -o vox
+curl -fsSL https://raw.githubusercontent.com/robit-man/cf_deploy/main/vox -o vox
 chmod +x vox
 
 # Deploy (interactive — walks you through everything)
