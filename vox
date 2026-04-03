@@ -816,6 +816,10 @@ cleanup() {
 }
 trap cleanup TERM INT
 
+# ── Ensure app binds to 0.0.0.0 (reachable by tunnel within container) ──
+export HOSTNAME="${HOSTNAME_OVERRIDE:-0.0.0.0}"
+export HOST="${HOST:-0.0.0.0}"
+
 # ── Start cloudflared tunnel inside the container ──
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
   echo "[vox] starting cloudflared tunnel (token mode)..."
@@ -1076,8 +1080,6 @@ COMPHEAD
               count: all
               capabilities: [gpu]
     runtime: nvidia
-    # Host network access for full connectivity inside container
-    network_mode: host
 COMPHC
 
     # Volume definitions
