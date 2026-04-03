@@ -1058,11 +1058,18 @@ COMPHEAD
       timeout: 10s
       retries: 3
       start_period: 40s
+    # GPU passthrough — all available GPUs exposed to container
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    runtime: nvidia
+    # Host network access for full connectivity inside container
+    network_mode: host
 COMPHC
-
-    # No ports exposed to host — tunnel handles all traffic
-    echo "    # No ports exposed — all traffic routed through Cloudflare Tunnel"
-    echo "    network_mode: bridge"
 
     # Volume definitions
     if [[ -n "$volume_def" ]]; then
@@ -1320,6 +1327,25 @@ cmd_setup() {
     sudo apt-get update -qq && sudo apt-get install -y -qq python3 2>/dev/null || true
   fi
 
+  # NVIDIA Container Toolkit (GPU passthrough)
+  if command -v nvidia-smi &>/dev/null; then
+    if ! docker info 2>/dev/null | grep -qi "nvidia"; then
+      info "NVIDIA GPU detected — installing container toolkit..."
+      curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
+      curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1 || true
+      sudo apt-get update -qq && sudo apt-get install -y -qq nvidia-container-toolkit 2>/dev/null || true
+      sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
+      sudo systemctl restart docker 2>/dev/null || true
+      info "NVIDIA Container Toolkit installed."
+    else
+      info "NVIDIA GPU + container toolkit: OK"
+    fi
+  else
+    info "No NVIDIA GPU detected — GPU passthrough will be skipped at runtime."
+  fi
+
   # ─────────────────────────────────────────────────────────────────────────
   # Step 1: Repository
   # ─────────────────────────────────────────────────────────────────────────
@@ -1542,6 +1568,32 @@ cmd_setup() {
   # ── Dockerfile ──
   if [[ "$USE_EXISTING_DOCKERFILE" == "true" ]]; then
     info "Using repo's existing Dockerfile"
+    # Patch: ensure cloudflared + entrypoint are present even in user Dockerfiles
+    if ! grep -q "cloudflared" "$REPO_PATH/Dockerfile" 2>/dev/null; then
+      info "Patching Dockerfile: adding cloudflared install"
+      # Append cloudflared install + entrypoint before the last CMD/ENTRYPOINT
+      local orig_cmd
+      orig_cmd=$(grep -E "^(CMD|ENTRYPOINT)" "$REPO_PATH/Dockerfile" | tail -1 || true)
+      if [[ -n "$orig_cmd" ]]; then
+        # Extract the start command from existing CMD/ENTRYPOINT
+        local start_from_dockerfile
+        start_from_dockerfile=$(echo "$orig_cmd" | sed 's/^CMD\s*//;s/^ENTRYPOINT\s*//' | sed 's/^\[//;s/\]$//;s/"//g;s/,/ /g')
+        # Generate entrypoint with existing start command
+        generate_entrypoint "$REPO_PATH/entrypoint.sh" "$start_from_dockerfile" "${DETECTED_PORT:-3000}"
+        # Append to Dockerfile: install cloudflared, copy entrypoint, override CMD
+        cat >> "$REPO_PATH/Dockerfile" <<'PATCHEOF'
+
+# --- vox: cloudflared + GPU support injected ---
+RUN apk add --no-cache curl 2>/dev/null || (apt-get update && apt-get install -y --no-install-recommends curl) ; \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+PATCHEOF
+        info "Patched: cloudflared + entrypoint added to existing Dockerfile"
+      fi
+    fi
   else
     DOCKERFILE="$REPO_PATH/Dockerfile"
     info "Writing $DOCKERFILE"
