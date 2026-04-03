@@ -2144,12 +2144,10 @@ cmd_destroy() {
   info "Removing .vox/ state..."
   rm -rf "$VOX_DIR"
 
-  # 6. Optionally remove the cloned repo itself
+  # 6. Remove the cloned repo
   if [[ -d "$REPO_PATH" ]]; then
-    if confirm "Also delete the cloned repo at $REPO_PATH?"; then
-      rm -rf "$REPO_PATH"
-      info "Removed $REPO_PATH"
-    fi
+    rm -rf "$REPO_PATH"
+    info "Removed $REPO_PATH"
   fi
 
   info "Destroy complete. Directory is clean."
