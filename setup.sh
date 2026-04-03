@@ -182,7 +182,7 @@ detect_project() {
     DETECTED_TYPE="node"
     DETECTED_BASE_IMAGE="node:20-alpine"
     DETECTED_COPY_DEPS="package.json package-lock.json* yarn.lock* pnpm-lock.yaml*"
-    DETECTED_IGNORE_PATTERNS="node_modules\n.next\n.nuxt\ndist\nbuild\n.env\n.env.local\n.git"
+    DETECTED_IGNORE_PATTERNS="node_modules\n.next\n.nuxt\ndist\nbuild\n.env.local\n.git"
 
     # Read package.json for details
     local pkg="$repo/package.json"
@@ -432,7 +432,7 @@ print(f'main:{d.get(\"main\", \"\")}')
   if [[ -f "$repo/requirements.txt" ]] || [[ -f "$repo/pyproject.toml" ]] || [[ -f "$repo/Pipfile" ]] || [[ -f "$repo/setup.py" ]]; then
     DETECTED_TYPE="python"
     DETECTED_BASE_IMAGE="python:3.12-slim"
-    DETECTED_IGNORE_PATTERNS=".venv\nvenv\n__pycache__\n*.pyc\n.env\n.git\ndist\n*.egg-info"
+    DETECTED_IGNORE_PATTERNS=".venv\nvenv\n__pycache__\n*.pyc\n.env.local\n.git\ndist\n*.egg-info"
 
     # Detect dependency file
     if [[ -f "$repo/pyproject.toml" ]]; then
@@ -545,7 +545,7 @@ print(f'main:{d.get(\"main\", \"\")}')
     DETECTED_BUILD_CMD="CGO_ENABLED=0 go build -o /app/server ."
     DETECTED_START_CMD="/app/server"
     DETECTED_PORT="8080"
-    DETECTED_IGNORE_PATTERNS=".git\n*.test\n.env"
+    DETECTED_IGNORE_PATTERNS=".git\n*.test\n.env.local"
     detect "Go project detected"
     return 0
   fi
@@ -562,7 +562,7 @@ print(f'main:{d.get(\"main\", \"\")}')
     bin_name=$(grep -m1 'name' "$repo/Cargo.toml" | sed 's/.*= *"\(.*\)"/\1/' || true)
     DETECTED_START_CMD="./target/release/${bin_name:-app}"
     DETECTED_PORT="8080"
-    DETECTED_IGNORE_PATTERNS="target\n.git\n.env"
+    DETECTED_IGNORE_PATTERNS="target\n.git\n.env.local"
     detect "Rust project detected"
     return 0
   fi
@@ -573,7 +573,7 @@ print(f'main:{d.get(\"main\", \"\")}')
     DETECTED_BASE_IMAGE="ruby:3.3-slim"
     DETECTED_COPY_DEPS="Gemfile Gemfile.lock*"
     DETECTED_INSTALL_CMD="bundle install"
-    DETECTED_IGNORE_PATTERNS=".git\n.env\nvendor/bundle\ntmp\nlog"
+    DETECTED_IGNORE_PATTERNS=".git\n.env.local\nvendor/bundle\ntmp\nlog"
 
     if [[ -f "$repo/config.ru" ]] || [[ -f "$repo/bin/rails" ]]; then
       DETECTED_TYPE="ruby/rails"
@@ -597,7 +597,7 @@ print(f'main:{d.get(\"main\", \"\")}')
     DETECTED_BASE_IMAGE="php:8.3-apache"
     DETECTED_COPY_DEPS="composer.json composer.lock*"
     DETECTED_INSTALL_CMD="composer install --no-dev --optimize-autoloader"
-    DETECTED_IGNORE_PATTERNS="vendor\n.git\n.env\nstorage/logs"
+    DETECTED_IGNORE_PATTERNS="vendor\n.git\n.env.local\nstorage/logs"
 
     if [[ -f "$repo/artisan" ]]; then
       DETECTED_TYPE="php/laravel"
@@ -624,7 +624,7 @@ print(f'main:{d.get(\"main\", \"\")}')
     DETECTED_BUILD_CMD=""
     DETECTED_START_CMD=""  # nginx runs by default
     DETECTED_PORT="80"
-    DETECTED_IGNORE_PATTERNS=".git\n.env"
+    DETECTED_IGNORE_PATTERNS=".git\n.env.local"
     detect "Static site detected — will serve with nginx"
     return 0
   fi
@@ -960,8 +960,12 @@ RUSTEOF
     fi
 
     # ── Build step ──
+    # Frameworks like Next.js need env vars during build for SSR/pre-render.
+    # Source .env if present, run build, then delete .env from image.
+    # Runtime env comes from docker env_file, not baked into the image.
     if [[ -n "$DETECTED_BUILD_CMD" ]]; then
-      echo "RUN ${DETECTED_BUILD_CMD}"
+      echo "RUN if [ -f .env ]; then set -a && . ./.env && set +a; fi && ${DETECTED_BUILD_CMD}"
+      echo "RUN rm -f .env"
       echo ""
     fi
 
@@ -1382,7 +1386,7 @@ cmd_setup() {
       ask DETECTED_START_CMD   "Start command" ""
       ask DETECTED_PORT        "Port" "3000"
       ask DETECTED_DATA_DIRS   "Persistent data dirs (blank if none)" ""
-      DETECTED_IGNORE_PATTERNS=".git\n.env\n.env.local"
+      DETECTED_IGNORE_PATTERNS=".git\n.env.local"
     fi
   fi
 
