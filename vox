@@ -1360,19 +1360,36 @@ cmd_setup() {
   fi
 
   # NVIDIA Container Toolkit (GPU passthrough)
+  # Idempotent + non-interactive: never re-fetches keyring if present, never prompts.
   if command -v nvidia-smi &>/dev/null; then
-    if ! docker info 2>/dev/null | grep -qi "nvidia"; then
+    if command -v nvidia-ctk &>/dev/null && docker info 2>/dev/null | grep -qi "nvidia"; then
+      info "NVIDIA GPU + container toolkit: OK"
+    elif command -v nvidia-ctk &>/dev/null; then
+      info "NVIDIA Container Toolkit present — configuring docker runtime..."
+      sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
+      sudo systemctl restart docker 2>/dev/null || true
+      info "NVIDIA Container Toolkit configured."
+    else
       info "NVIDIA GPU detected — installing container toolkit..."
-      curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
-      curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1 || true
-      sudo apt-get update -qq && sudo apt-get install -y -qq nvidia-container-toolkit 2>/dev/null || true
+      # Only fetch the keyring if it does not already exist. Use --batch --yes
+      # so gpg never prompts (the silent hang on Ctrl+C was caused by this).
+      if [ ! -s /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ]; then
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null \
+          | sudo gpg --batch --yes --dearmor \
+              -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+              >/dev/null 2>&1 </dev/null || true
+      fi
+      # Only write the apt source list if missing.
+      if [ ! -s /etc/apt/sources.list.d/nvidia-container-toolkit.list ]; then
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list 2>/dev/null \
+          | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+          | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1 || true
+      fi
+      sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null 2>/dev/null || true
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit </dev/null 2>/dev/null || true
       sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
       sudo systemctl restart docker 2>/dev/null || true
       info "NVIDIA Container Toolkit installed."
-    else
-      info "NVIDIA GPU + container toolkit: OK"
     fi
   else
     info "No NVIDIA GPU detected — GPU passthrough will be skipped at runtime."
