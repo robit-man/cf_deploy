@@ -32,6 +32,23 @@ RED='\033[0;31m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILDKIT / COMPOSE STREAMING — force real-time, line-by-line output
+# ─────────────────────────────────────────────────────────────────────────────
+# Without these, `docker compose build` uses BuildKit's fancy TTY progress
+# mode which buffers everything and surfaces nothing until the user interrupts.
+# Symptom: "Building container..." followed by a silent spinner that only
+# dumps output after Ctrl+C.
+#
+# Setting BUILDKIT_PROGRESS=plain + passing --progress=plain forces every
+# buildkit stage to flush its stdout/stderr line-by-line so users see each
+# layer, RUN step, and warning in real time.
+export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
+export COMPOSE_DOCKER_CLI_BUILD="${COMPOSE_DOCKER_CLI_BUILD:-1}"
+export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
+# Line-buffer python subprocesses too (vox_save_config, vox_config_get, etc.)
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+
 get_cols() { tput cols 2>/dev/null || echo 80; }
 
 banner() {
@@ -62,7 +79,124 @@ info()    { echo -e "  ${GREEN}[INFO]${NC}  $1"; }
 warn()    { echo -e "  ${YELLOW}[WARN]${NC}  $1"; }
 err()     { echo -e "  ${RED}[ERR]${NC}  $1"; }
 detect()  { echo -e "  ${MAGENTA}[AUTO]${NC}  $1"; }
+step()    { echo -e "  ${CYAN}[STEP]${NC}  $1"; }
 prompt()  { echo -en "${BOLD}$1${NC}"; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMING WRAPPERS — surface real-time state during long-running subprocesses
+# ─────────────────────────────────────────────────────────────────────────────
+# These wrap slow docker operations so the user sees every line of output as
+# it happens instead of a silent spinner. They also mirror output to a log
+# file for post-mortem review and return the child process's real exit code
+# (not `tee`'s) via PIPESTATUS.
+
+stream_open() {
+  local label="${1:-output}"
+  local cols inner hbar
+  cols=$(get_cols)
+  inner=$((cols - 8 - ${#label}))
+  [[ "$inner" -lt 10 ]] && inner=10
+  hbar=""
+  for ((i=0; i<inner; i++)); do hbar="${hbar}─"; done
+  echo ""
+  echo -e "  ${DIM}┌─ ${label} ${hbar}${NC}"
+}
+
+stream_close() {
+  local status="${1:-done}"
+  local color="${2:-$DIM}"
+  local cols inner hbar
+  cols=$(get_cols)
+  inner=$((cols - 8 - ${#status}))
+  [[ "$inner" -lt 10 ]] && inner=10
+  hbar=""
+  for ((i=0; i<inner; i++)); do hbar="${hbar}─"; done
+  echo -e "  ${DIM}└─${NC} ${color}${status}${NC} ${DIM}${hbar}${NC}"
+  echo ""
+}
+
+# Pick the right --progress flag style based on compose version.
+# docker compose v2 supports --progress=plain on `build`; docker-compose v1
+# does not, so for v1 we rely on the BUILDKIT_PROGRESS=plain env var alone.
+_compose_progress_flag() {
+  if [[ "${COMPOSE_CMD:-docker compose}" == "docker compose" ]]; then
+    echo "--progress=plain"
+  else
+    echo ""
+  fi
+}
+
+# Ensure VOX_DIR exists before writing logs (works even before setup runs).
+_ensure_log_dir() {
+  local d="${VOX_DIR:-.vox}"
+  mkdir -p "$d" 2>/dev/null || true
+  echo "$d"
+}
+
+# compose_build [extra-args...] — run `docker compose build` with streaming
+# output, a mirrored log file, and a proper exit code.
+compose_build() {
+  local log_dir build_log progress_flag
+  log_dir=$(_ensure_log_dir)
+  build_log="$log_dir/build.log"
+  progress_flag=$(_compose_progress_flag)
+
+  info "Building container image (streaming output below, log: $build_log)"
+  stream_open "docker compose build"
+
+  # 2>&1  → merge stderr into stdout (buildkit writes progress to stderr)
+  # tee   → mirror to build log for post-mortem inspection
+  # PIPESTATUS → return the real build exit code, not tee's
+  set +e
+  if [[ -n "$progress_flag" ]]; then
+    $COMPOSE_CMD build $progress_flag "$@" 2>&1 | tee "$build_log"
+  else
+    $COMPOSE_CMD build "$@" 2>&1 | tee "$build_log"
+  fi
+  local rc=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    stream_close "build ok" "$GREEN"
+  else
+    stream_close "build FAILED (exit $rc)" "$RED"
+    err "Build failed — full log at $build_log"
+  fi
+  return "$rc"
+}
+
+# compose_up [extra-args...] — run `docker compose up -d` with streaming
+# output so the user sees network/volume/container creation in real time.
+compose_up() {
+  info "Starting services (streaming output below)"
+  stream_open "docker compose up -d"
+  set +e
+  $COMPOSE_CMD up -d "$@" 2>&1
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    stream_close "up ok" "$GREEN"
+  else
+    stream_close "up FAILED (exit $rc)" "$RED"
+  fi
+  return "$rc"
+}
+
+# compose_down [extra-args...] — streamed `docker compose down` for symmetry.
+compose_down() {
+  info "Stopping services (streaming output below)"
+  stream_open "docker compose down"
+  set +e
+  $COMPOSE_CMD down "$@" 2>&1
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    stream_close "down ok" "$GREEN"
+  else
+    stream_close "down FAILED (exit $rc)" "$RED"
+  fi
+  return "$rc"
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SUDO HELPERS — never let `sudo` silently hang the script.
@@ -1887,11 +2021,18 @@ CFGEOF
   if [[ "$AUTO_MODE" == "true" ]] || confirm "Build and start now?"; then
     cd "$WORK_DIR"
 
-    info "Building container..."
-    $COMPOSE_CMD build
+    step "Phase 1/2: Build container image"
+    if ! compose_build; then
+      err "Initial build failed — not starting services. Fix errors above and re-run."
+      exit 1
+    fi
 
-    info "Starting services..."
-    $COMPOSE_CMD up -d
+    step "Phase 2/2: Start services"
+    if ! compose_up; then
+      err "Service startup failed after successful build."
+      err "Run './vox logs' to diagnose."
+      exit 1
+    fi
 
     # Log initial deploy
     vox_log_deploy "success" "$image_tag"
@@ -1964,12 +2105,22 @@ cmd_deploy() {
 
   # 3. Build
   cd "$WORK_DIR"
-  info "Building..."
-  $COMPOSE_CMD build
+  step "Phase 1/3: Build new image"
+  if ! compose_build; then
+    err "Build failed — current running image is unchanged."
+    vox_log_deploy "build-failed" "$rollback_tag"
+    exit 1
+  fi
 
   # 4. Zero-downtime restart
-  info "Restarting services..."
-  $COMPOSE_CMD up -d
+  step "Phase 2/3: Restart services with new image"
+  if ! compose_up; then
+    err "Restart failed after successful build."
+    vox_log_deploy "restart-failed" "$rollback_tag"
+    exit 1
+  fi
+
+  step "Phase 3/3: Wait for healthcheck"
 
   # 5. Wait for healthcheck
   local git_sha=""
@@ -2073,24 +2224,32 @@ cmd_stop() {
   vox_load_config
   WORK_DIR="$(pwd)"
   cd "$WORK_DIR"
-  info "Stopping services..."
-  $COMPOSE_CMD down
+  compose_down
 }
 
 cmd_start() {
   vox_load_config
   WORK_DIR="$(pwd)"
   cd "$WORK_DIR"
-  info "Starting services..."
-  $COMPOSE_CMD up -d
+  compose_up
 }
 
 cmd_restart() {
   vox_load_config
   WORK_DIR="$(pwd)"
   cd "$WORK_DIR"
-  info "Restarting services..."
-  $COMPOSE_CMD restart
+  info "Restarting services (streaming output below)"
+  stream_open "docker compose restart"
+  set +e
+  $COMPOSE_CMD restart 2>&1
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    stream_close "restart ok" "$GREEN"
+  else
+    stream_close "restart FAILED (exit $rc)" "$RED"
+  fi
+  return "$rc"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2153,15 +2312,18 @@ if t:
   info "Rolling back to: $rollback_tag"
 
   cd "$WORK_DIR"
-  $COMPOSE_CMD down
+  step "Phase 1/3: Stop running services"
+  compose_down
 
   # Temporarily override the compose image — use docker tag to re-point
+  step "Phase 2/3: Re-tag rollback image as current"
   local container_name
   container_name=$(echo "$CFG_REPO_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
   local current_tag="${CFG_REPO_DIR}:latest"
   docker tag "$rollback_tag" "$current_tag" 2>/dev/null || true
 
-  $COMPOSE_CMD up -d
+  step "Phase 3/3: Start services from rollback image"
+  compose_up
 
   local ts
   ts=$(date -Iseconds)
@@ -2216,7 +2378,7 @@ PYEOF
 
       # Redeploy
       cd "$WORK_DIR"
-      $COMPOSE_CMD up -d
+      compose_up
       info "Services restarted with updated env."
       ;;
 
@@ -2245,7 +2407,7 @@ PYEOF
 
       # Redeploy
       cd "$WORK_DIR"
-      $COMPOSE_CMD up -d
+      compose_up
       info "Services restarted with updated env."
       ;;
 
@@ -2342,9 +2504,9 @@ deploy_with_rollback() {
     docker tag "$pre_image" "$rollback_tag" 2>/dev/null || true
   fi
 
-  # Pull
+  # Pull — keep stderr visible so the user sees why a pull failed (auth, etc.)
   info "Pulling latest from $CFG_REPO_BRANCH..."
-  if ! git -C "$REPO_PATH" pull origin "$CFG_REPO_BRANCH" 2>/dev/null; then
+  if ! git -C "$REPO_PATH" pull origin "$CFG_REPO_BRANCH"; then
     warn "Git pull failed — aborting deploy, keeping current version."
     return 1
   fi
@@ -2352,17 +2514,25 @@ deploy_with_rollback() {
   local post_sha=""
   post_sha=$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null || true)
 
-  # Build
-  info "Building ($post_sha)..."
-  if ! $COMPOSE_CMD build 2>/dev/null; then
+  # Build — stream full output so build failures are diagnosable
+  step "Auto-deploy phase 1/2: Build ($post_sha)"
+  if ! compose_build; then
     warn "Build failed — rolling back to $pre_sha..."
-    git -C "$REPO_PATH" reset --hard "$pre_sha" 2>/dev/null || true
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
     vox_log_deploy "build-failed" "$rollback_tag"
     return 1
   fi
 
-  # Restart
-  $COMPOSE_CMD up -d 2>/dev/null
+  # Restart — stream output so start failures are visible
+  step "Auto-deploy phase 2/2: Restart services"
+  if ! compose_up; then
+    warn "Start failed after successful build — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    compose_build || true
+    compose_up || true
+    vox_log_deploy "start-failed" "$rollback_tag"
+    return 1
+  fi
 
   # Healthcheck
   if wait_for_health "$container_name" 120; then
@@ -2370,11 +2540,11 @@ deploy_with_rollback() {
     info "Deploy successful ($post_sha) — https://$CFG_HOSTNAME"
     return 0
   else
-    # Healthcheck failed — rollback
-    warn "Healthcheck failed — rolling back..."
-    git -C "$REPO_PATH" reset --hard "$pre_sha" 2>/dev/null || true
-    $COMPOSE_CMD build 2>/dev/null || true
-    $COMPOSE_CMD up -d 2>/dev/null || true
+    # Healthcheck failed — rollback (keep output visible during recovery)
+    warn "Healthcheck failed — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    compose_build || true
+    compose_up || true
     vox_log_deploy "rollback" "$rollback_tag"
     warn "Rolled back to $pre_sha"
     return 1
