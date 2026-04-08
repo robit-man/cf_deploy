@@ -220,6 +220,85 @@ with_timeout() {
   fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCKER PREFLIGHT — fail loudly and fast when the daemon is wedged
+# ─────────────────────────────────────────────────────────────────────────────
+# Background: on systems with Docker's data root on ZFS + overlay2 storage
+# driver, `dockerd` can deadlock in the kernel during container cleanup and
+# get stuck in D-state. Once that happens, every `docker` command will hang
+# for its full RPC timeout (2+ minutes) before returning. We refuse to let
+# vox inherit that pain: a 5-second probe tells us immediately whether the
+# daemon is alive, and if it isn't we print the exact remediation steps and
+# exit instead of silently hanging forever.
+preflight_docker() {
+  # Cheap: does the binary even exist?
+  if ! command -v docker &>/dev/null; then
+    err "docker CLI not found in PATH — install docker first."
+    return 127
+  fi
+
+  # Is the socket present at all?
+  local sock=/var/run/docker.sock
+  if [[ ! -S "$sock" ]]; then
+    err "Docker socket $sock not present — is dockerd running?"
+    err "Try: sudo systemctl status docker"
+    return 1
+  fi
+
+  # Bounded probe: `docker info` normally returns in <1s on a healthy daemon.
+  # If it takes more than 5s, dockerd is either starting, overloaded, or
+  # wedged in D-state — either way we don't want to inherit the wait.
+  if with_timeout 5 docker info &>/dev/null; then
+    return 0
+  fi
+
+  # Daemon is unresponsive. Before giving up, print a focused diagnosis so
+  # the user isn't left wondering why vox bailed.
+  echo ""
+  err "Docker daemon is not responding (timed out after 5s)."
+  echo ""
+
+  # Look for D-state dockerd — the classic overlay2-on-ZFS deadlock signature.
+  local wedged=""
+  wedged=$(ps -eo pid,stat,comm 2>/dev/null | awk '$3=="dockerd" && $2 ~ /D/ {print $1}' | head -5)
+  if [[ -n "$wedged" ]]; then
+    err "Found dockerd processes stuck in D-state (uninterruptible I/O wait):"
+    while IFS= read -r p; do echo "        PID $p"; done <<< "$wedged"
+    echo ""
+    err "This usually means overlay2 cleanup deadlocked against ZFS."
+    err "D-state processes cannot be killed — the only fix is a reboot."
+    echo ""
+    err "Permanent fix (do this after the reboot, before starting docker):"
+    echo "        sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'"
+    echo "        {"
+    echo "            \"data-root\": \"/data/docker\","
+    echo "            \"storage-driver\": \"zfs\""
+    echo "        }"
+    echo "        JSON"
+    echo "        sudo rm -rf /data/docker/overlay2   # discard old layers"
+    echo "        sudo systemctl start docker"
+  else
+    err "Docker daemon exists but isn't responding. Possible causes:"
+    err "  • Daemon still starting → wait ~30s and retry"
+    err "  • Daemon crashed       → sudo systemctl status docker"
+    err "  • Socket permissions   → check group membership for 'docker'"
+  fi
+  echo ""
+  return 1
+}
+
+# Run preflight once per invocation; cache the result so multiple subcommands
+# in a single vox call don't each pay the probe cost.
+DOCKER_PREFLIGHT_DONE=""
+require_docker() {
+  [[ "$DOCKER_PREFLIGHT_DONE" == "yes" ]] && return 0
+  if preflight_docker; then
+    DOCKER_PREFLIGHT_DONE="yes"
+    return 0
+  fi
+  exit 1
+}
+
 # Ensure we can run privileged commands non-interactively.
 #   $1 = "interactive" → may prompt for the password once and cache it
 #   $1 = "auto"        → never prompt; just probe and remember the answer
@@ -2753,6 +2832,28 @@ cmd_help() {
 # Determine subcommand: first arg that does not look like a file path
 SUBCOMMAND="${1:-}"
 shift 2>/dev/null || true
+
+# Commands that need a live docker daemon. `help`, `history`, `env` (read),
+# and `watch stop/status` are intentionally excluded — they should work even
+# when docker is down so the user can diagnose the situation.
+case "$SUBCOMMAND" in
+  setup|deploy|logs|status|stop|start|restart|rollback|destroy)
+    require_docker
+    ;;
+  env)
+    # `env set` / `env unset` redeploy the container, so they need docker.
+    # Plain `env` (read-only display) does not.
+    case "${1:-}" in
+      set|unset) require_docker ;;
+    esac
+    ;;
+  watch)
+    # `watch start` forks a loop that calls docker; `watch stop`/`status` don't.
+    case "${1:-start}" in
+      start) require_docker ;;
+    esac
+    ;;
+esac
 
 case "$SUBCOMMAND" in
   setup)
