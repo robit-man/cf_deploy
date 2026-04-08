@@ -64,6 +64,94 @@ err()     { echo -e "  ${RED}[ERR]${NC}  $1"; }
 detect()  { echo -e "  ${MAGENTA}[AUTO]${NC}  $1"; }
 prompt()  { echo -en "${BOLD}$1${NC}"; }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SUDO HELPERS — never let `sudo` silently hang the script.
+# `sudo` writes its password prompt to /dev/tty by default, so redirecting
+# stderr to /dev/null does NOT hide the prompt — but it DOES hide every other
+# diagnostic, which made earlier silent hangs impossible to debug. We split
+# "is sudo available without a password" from "actually run a privileged
+# command" and put a hard timeout on every privileged call so an unattended
+# auto-deploy can never block on a missing password.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SUDO_OK=""   # "yes" once we know sudo works (cached or root); "no" if unavailable
+
+# Wrap a command in `timeout` if the binary exists; otherwise run it bare.
+with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout &>/dev/null; then
+    timeout --foreground "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Ensure we can run privileged commands non-interactively.
+#   $1 = "interactive" → may prompt for the password once and cache it
+#   $1 = "auto"        → never prompt; just probe and remember the answer
+# Returns 0 if privileged commands will work, 1 otherwise.
+ensure_sudo() {
+  local mode="${1:-auto}"
+
+  # Already cached.
+  [[ "$SUDO_OK" == "yes" ]] && return 0
+  [[ "$SUDO_OK" == "no"  ]] && return 1
+
+  # Running as root → no sudo needed.
+  if [[ "$(id -u)" == "0" ]]; then
+    SUDO_OK="yes"
+    return 0
+  fi
+
+  # No sudo binary at all → give up.
+  if ! command -v sudo &>/dev/null; then
+    SUDO_OK="no"
+    warn "sudo not found — privileged steps will be skipped."
+    return 1
+  fi
+
+  # Passwordless sudo already works (root, NOPASSWD, or fresh timestamp).
+  if sudo -n true 2>/dev/null; then
+    SUDO_OK="yes"
+    return 0
+  fi
+
+  # Need a password. In auto mode we refuse to block.
+  if [[ "$mode" != "interactive" ]]; then
+    SUDO_OK="no"
+    return 1
+  fi
+
+  # Interactive: prompt the user once and cache the credential.
+  echo ""
+  warn "Some setup steps need root privileges (apt-get, nvidia-ctk, systemctl)."
+  info "You will be prompted for your sudo password once; it will be cached."
+  if with_timeout 120 sudo -v; then
+    SUDO_OK="yes"
+    return 0
+  else
+    SUDO_OK="no"
+    warn "sudo authentication failed or timed out — privileged steps will be skipped."
+    return 1
+  fi
+}
+
+# Run a privileged command with a hard timeout. Stderr is intentionally NOT
+# suppressed so the user always sees real failures. Returns the command's
+# exit code, or 126 if sudo is unavailable.
+sudo_run() {
+  local secs="$1"; shift
+  if [[ "$(id -u)" == "0" ]]; then
+    with_timeout "$secs" "$@"
+    return $?
+  fi
+  if [[ "$SUDO_OK" != "yes" ]]; then
+    return 126
+  fi
+  with_timeout "$secs" sudo -n "$@"
+  return $?
+}
+
 ask() {
   local varname="$1" text="$2" default="${3:-}"
   if [[ -n "$default" ]]; then
@@ -1287,6 +1375,7 @@ cmd_setup() {
       --env)      IMPORTED_ENV_FILE="$2"; shift 2 ;;
       --branch)   CLI_BRANCH="$2"; shift 2 ;;
       --autopull) CLI_AUTOPULL="$2"; shift 2 ;;
+      --skip-gpu) SKIP_GPU="true"; shift ;;
       *)
         # Bare arg — check if it's a file (drag-and-drop .env)
         local cleaned
@@ -1309,15 +1398,27 @@ cmd_setup() {
 
   info "Checking prerequisites..."
 
+  # Decide whether we may interactively prompt for sudo. In AUTO_MODE we
+  # refuse to block; otherwise we ask once and cache the credential.
+  local SUDO_MODE="interactive"
+  [[ "$AUTO_MODE" == "true" ]] && SUDO_MODE="auto"
+
   # ── Auto-install all dependencies ──
+
+  # Track which dependencies actually need root so we only ask for sudo if
+  # something is missing. Privileged steps requested while sudo is unavailable
+  # will warn and skip rather than hang.
+  local NEEDS_ROOT="false"
 
   # Docker
   if command -v docker &>/dev/null; then
     info "Docker: $(docker --version | head -c 60)"
   else
+    NEEDS_ROOT="true"
+    ensure_sudo "$SUDO_MODE" || true
     info "Installing Docker..."
     curl -fsSL https://get.docker.com | sh
-    sudo usermod -aG docker "$USER" 2>/dev/null || true
+    sudo_run 30 usermod -aG docker "$USER" || true
     info "Docker installed."
   fi
 
@@ -1329,8 +1430,11 @@ cmd_setup() {
     COMPOSE_CMD="docker-compose"
     info "Docker Compose: OK"
   else
+    NEEDS_ROOT="true"
+    ensure_sudo "$SUDO_MODE" || true
     info "Installing Docker Compose..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
+    sudo_run 300 apt-get update -qq || true
+    sudo_run 300 apt-get install -y -qq docker-compose-plugin || true
     COMPOSE_CMD="docker compose"
   fi
 
@@ -1338,8 +1442,11 @@ cmd_setup() {
   if command -v git &>/dev/null; then
     info "git: OK"
   else
+    NEEDS_ROOT="true"
+    ensure_sudo "$SUDO_MODE" || true
     info "Installing git..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq git 2>/dev/null || true
+    sudo_run 300 apt-get update -qq || true
+    sudo_run 300 apt-get install -y -qq git || true
     if ! command -v git &>/dev/null; then
       err "Failed to install git."
       exit 1
@@ -1349,51 +1456,91 @@ cmd_setup() {
 
   # curl (needed for cloudflared download inside Docker build)
   if ! command -v curl &>/dev/null; then
+    NEEDS_ROOT="true"
+    ensure_sudo "$SUDO_MODE" || true
     info "Installing curl..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq curl 2>/dev/null || true
+    sudo_run 300 apt-get update -qq || true
+    sudo_run 300 apt-get install -y -qq curl || true
   fi
 
   # python3 (needed for package.json parsing and config)
   if ! command -v python3 &>/dev/null; then
+    NEEDS_ROOT="true"
+    ensure_sudo "$SUDO_MODE" || true
     info "Installing python3..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq python3 2>/dev/null || true
+    sudo_run 300 apt-get update -qq || true
+    sudo_run 300 apt-get install -y -qq python3 || true
   fi
 
   # NVIDIA Container Toolkit (GPU passthrough)
-  # Idempotent + non-interactive: never re-fetches keyring if present, never prompts.
-  if command -v nvidia-smi &>/dev/null; then
-    if command -v nvidia-ctk &>/dev/null && docker info 2>/dev/null | grep -qi "nvidia"; then
+  # Fully idempotent and never blocks: we read /etc/docker/daemon.json directly
+  # (no docker-daemon roundtrip required) so we can detect "already configured"
+  # without needing the user to be in the docker group, and every privileged
+  # call has a hard timeout so an unattended deploy can never hang here.
+  if [[ "${SKIP_GPU:-false}" == "true" ]]; then
+    info "GPU configuration skipped (SKIP_GPU=true)."
+  elif command -v nvidia-smi &>/dev/null; then
+    # Cheap, root-free check: is the nvidia runtime already wired into docker?
+    local NVIDIA_RUNTIME_CONFIGURED="false"
+    if [ -r /etc/docker/daemon.json ] \
+       && grep -q '"nvidia"' /etc/docker/daemon.json 2>/dev/null; then
+      NVIDIA_RUNTIME_CONFIGURED="true"
+    elif docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
+      NVIDIA_RUNTIME_CONFIGURED="true"
+    fi
+
+    if [[ "$NVIDIA_RUNTIME_CONFIGURED" == "true" ]] && command -v nvidia-ctk &>/dev/null; then
       info "NVIDIA GPU + container toolkit: OK"
     elif command -v nvidia-ctk &>/dev/null; then
-      info "NVIDIA Container Toolkit present — configuring docker runtime..."
-      sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
-      sudo systemctl restart docker 2>/dev/null || true
-      info "NVIDIA Container Toolkit configured."
+      NEEDS_ROOT="true"
+      if ensure_sudo "$SUDO_MODE"; then
+        info "NVIDIA Container Toolkit present — configuring docker runtime..."
+        if sudo_run 60 nvidia-ctk runtime configure --runtime=docker; then
+          if sudo_run 90 systemctl restart docker; then
+            info "NVIDIA Container Toolkit configured."
+          else
+            warn "docker restart failed or timed out — restart manually: sudo systemctl restart docker"
+          fi
+        else
+          warn "nvidia-ctk runtime configure failed — continuing without GPU passthrough."
+        fi
+      else
+        warn "Skipping GPU runtime configuration (no sudo). Re-run without --auto or set SKIP_GPU=true to silence this."
+      fi
     else
-      info "NVIDIA GPU detected — installing container toolkit..."
-      # Only fetch the keyring if it does not already exist. Use --batch --yes
-      # so gpg never prompts (the silent hang on Ctrl+C was caused by this).
-      if [ ! -s /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ]; then
-        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null \
-          | sudo gpg --batch --yes --dearmor \
-              -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
-              >/dev/null 2>&1 </dev/null || true
+      NEEDS_ROOT="true"
+      if ensure_sudo "$SUDO_MODE"; then
+        info "NVIDIA GPU detected — installing container toolkit..."
+        # Only fetch the keyring if it does not already exist. Use --batch --yes
+        # so gpg never prompts (a previous silent hang was caused by this).
+        if [ ! -s /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ]; then
+          curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null \
+            | sudo_run 60 gpg --batch --yes --dearmor \
+                -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+            || true
+        fi
+        # Only write the apt source list if missing.
+        if [ ! -s /etc/apt/sources.list.d/nvidia-container-toolkit.list ]; then
+          curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list 2>/dev/null \
+            | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+            | sudo_run 30 tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null \
+            || true
+        fi
+        sudo_run 300 env DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null || true
+        sudo_run 600 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit </dev/null || true
+        sudo_run 60 nvidia-ctk runtime configure --runtime=docker || true
+        sudo_run 90 systemctl restart docker || true
+        info "NVIDIA Container Toolkit install attempted (continuing regardless)."
+      else
+        warn "Skipping GPU toolkit install (no sudo). Re-run without --auto or set SKIP_GPU=true to silence this."
       fi
-      # Only write the apt source list if missing.
-      if [ ! -s /etc/apt/sources.list.d/nvidia-container-toolkit.list ]; then
-        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list 2>/dev/null \
-          | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-          | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1 || true
-      fi
-      sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null 2>/dev/null || true
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit </dev/null 2>/dev/null || true
-      sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
-      sudo systemctl restart docker 2>/dev/null || true
-      info "NVIDIA Container Toolkit installed."
     fi
   else
     info "No NVIDIA GPU detected — GPU passthrough will be skipped at runtime."
   fi
+
+  # Suppress unused-variable warning under set -u; NEEDS_ROOT is informational.
+  : "${NEEDS_ROOT}"
 
   # ─────────────────────────────────────────────────────────────────────────
   # Step 1: Repository
@@ -2425,6 +2572,7 @@ cmd_help() {
   box_line "  --env PATH          Path to .env file"
   box_line "  --branch BRANCH     Git branch (default: main)"
   box_line "  --autopull false    Disable auto-redeploy watcher"
+  box_line "  --skip-gpu          Skip NVIDIA Container Toolkit configuration"
   box_render
 }
 
