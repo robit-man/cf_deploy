@@ -2224,6 +2224,7 @@ cmd_deploy() {
 
   if wait_for_health "$app_container" 120; then
     vox_log_deploy "success" "$rollback_tag"
+    echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
     box_line "Deploy successful"
     box_line "  Git SHA: ${git_sha:-(unknown)}"
     box_line "  Image:   $rollback_tag"
@@ -2398,4 +2399,559 @@ if t:
   local rollback_tag="${tags[$idx]}"
 
   # Check image actually exists
-  if ! do
+  if ! docker image inspect "$rollback_tag" &>/dev/null 2>&1; then
+    err "Image '$rollback_tag' not found locally. Cannot roll back to it."
+    exit 1
+  fi
+
+  info "Rolling back to: $rollback_tag"
+
+  cd "$WORK_DIR"
+  step "Phase 1/3: Stop running services"
+  compose_down
+
+  # Temporarily override the compose image — use docker tag to re-point
+  step "Phase 2/3: Re-tag rollback image as current"
+  local container_name
+  container_name=$(echo "$CFG_REPO_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
+  local current_tag="${CFG_REPO_DIR}:latest"
+  docker tag "$rollback_tag" "$current_tag" 2>/dev/null || true
+
+  step "Phase 3/3: Start services from rollback image"
+  compose_up
+
+  local ts
+  ts=$(date -Iseconds)
+  vox_log_deploy "rollback:$rollback_tag" "$rollback_tag"
+
+  info "Rollback complete to $rollback_tag"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: env / env set / env unset
+# ═════════════════════════════════════════════════════════════════════════════
+
+cmd_env() {
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  local env_file="$REPO_PATH/.env"
+
+  local subcmd="${1:-}"
+
+  case "$subcmd" in
+    set)
+      # ./vox env set KEY=VALUE
+      local kv="${2:-}"
+      if [[ -z "$kv" ]] || [[ "$kv" != *"="* ]]; then
+        err "Usage: ./vox env set KEY=VALUE"
+        exit 1
+      fi
+      local key="${kv%%=*}"
+      local value="${kv#*=}"
+
+      if [[ ! -f "$env_file" ]]; then
+        touch "$env_file"
+      fi
+
+      # Update or append
+      if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+        # Replace existing
+        python3 - <<PYEOF
+import re
+with open('$env_file', 'r') as f:
+    content = f.read()
+content = re.sub(r'^${key}=.*$', '${key}=${value}', content, flags=re.MULTILINE)
+with open('$env_file', 'w') as f:
+    f.write(content)
+PYEOF
+        info "Updated $key in $env_file"
+      else
+        echo "${key}=${value}" >> "$env_file"
+        info "Added $key to $env_file"
+      fi
+
+      # Redeploy
+      cd "$WORK_DIR"
+      compose_up
+      info "Services restarted with updated env."
+      ;;
+
+    unset)
+      # ./vox env unset KEY
+      local key="${2:-}"
+      if [[ -z "$key" ]]; then
+        err "Usage: ./vox env unset KEY"
+        exit 1
+      fi
+
+      if [[ ! -f "$env_file" ]]; then
+        err "No .env file found at $env_file"
+        exit 1
+      fi
+
+      python3 - <<PYEOF
+import re
+with open('$env_file', 'r') as f:
+    lines = f.readlines()
+lines = [l for l in lines if not re.match(r'^${key}=', l)]
+with open('$env_file', 'w') as f:
+    f.writelines(lines)
+PYEOF
+      info "Removed $key from $env_file"
+
+      # Redeploy
+      cd "$WORK_DIR"
+      compose_up
+      info "Services restarted with updated env."
+      ;;
+
+    "")
+      # ./vox env — show all vars, masking secrets
+      if [[ ! -f "$env_file" ]]; then
+        err "No .env file found at $env_file"
+        exit 1
+      fi
+
+      banner "Environment: $CFG_REPO_DIR"
+      while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*) ]]; then
+          local k="${BASH_REMATCH[1]}"
+          local v="${BASH_REMATCH[2]}"
+          if [[ "$k" =~ (SECRET|TOKEN|PASSWORD|KEY|PRIVATE|AUTH) ]]; then
+            echo -e "  ${CYAN}${k}${NC}=${DIM}****${NC}"
+          else
+            echo -e "  ${CYAN}${k}${NC}=${v}"
+          fi
+        fi
+      done < "$env_file"
+      ;;
+
+    *)
+      err "Unknown env subcommand: $subcmd"
+      err "Usage: ./vox env [set KEY=VALUE | unset KEY]"
+      exit 1
+      ;;
+  esac
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: history
+# ═════════════════════════════════════════════════════════════════════════════
+
+cmd_history() {
+  vox_load_config
+
+  if [[ ! -d "$VOX_DEPLOYS" ]]; then
+    info "No deploy history yet."
+    return 0
+  fi
+
+  local files
+  files=$(ls "$VOX_DEPLOYS"/*.json 2>/dev/null | sort -r | head -20 || true)
+  if [[ -z "$files" ]]; then
+    info "No deploys recorded yet."
+    return 0
+  fi
+
+  banner "Deploy History"
+  printf "  %-30s %-10s %-40s %s\n" "Timestamp" "SHA" "Image Tag" "Status"
+  printf "  %-30s %-10s %-40s %s\n" "─────────────────────────────" "─────────" "───────────────────────────────────────" "──────"
+
+  while IFS= read -r f; do
+    python3 - <<PYEOF
+import json
+d = json.load(open('$f'))
+ts  = d.get('timestamp','')[:19]
+sha = d.get('git_sha','')[:9]
+img = d.get('image_tag','')[:39]
+st  = d.get('status','')
+print(f"  {ts:<30} {sha:<10} {img:<40} {st}")
+PYEOF
+  done <<< "$files"
+  echo ""
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: watch
+# ═════════════════════════════════════════════════════════════════════════════
+
+deploy_with_rollback() {
+  # Deploy and auto-rollback to previous image on failure.
+  # Used by the watch loop for safe unattended deploys.
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  COMPOSE_CMD="${CFG_COMPOSE_CMD:-docker compose}"
+
+  local container_name
+  container_name=$(echo "$CFG_REPO_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
+
+  # Save current state for rollback
+  local pre_sha=""
+  pre_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+  local pre_image=""
+  pre_image=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || true)
+  local rollback_tag="${CFG_REPO_DIR}:rollback-$(date +%Y%m%d%H%M%S)"
+  if [[ -n "$pre_image" ]]; then
+    docker tag "$pre_image" "$rollback_tag" 2>/dev/null || true
+  fi
+
+  # Pull — keep stderr visible so the user sees why a pull failed (auth, etc.)
+  info "Pulling latest from $CFG_REPO_BRANCH..."
+  if ! git -C "$REPO_PATH" pull origin "$CFG_REPO_BRANCH"; then
+    warn "Git pull failed — aborting deploy, keeping current version."
+    return 1
+  fi
+
+  local post_sha=""
+  post_sha=$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null || true)
+
+  # Build — stream full output so build failures are diagnosable
+  step "Auto-deploy phase 1/2: Build ($post_sha)"
+  if ! compose_build; then
+    warn "Build failed — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    vox_log_deploy "build-failed" "$rollback_tag"
+    return 1
+  fi
+
+  # Restart — stream output so start failures are visible
+  step "Auto-deploy phase 2/2: Restart services"
+  if ! compose_up; then
+    warn "Start failed after successful build — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    compose_build || true
+    compose_up || true
+    vox_log_deploy "start-failed" "$rollback_tag"
+    return 1
+  fi
+
+  # Healthcheck
+  if wait_for_health "$container_name" 120; then
+    vox_log_deploy "success" "$rollback_tag"
+    # Record the currently-deployed SHA so the watch loop can detect drift
+    # between local HEAD and what's actually live, even when local == origin
+    # (i.e. when pushes are made from the same clone the watcher is in).
+    echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
+    info "Deploy successful ($post_sha) — https://$CFG_HOSTNAME"
+    return 0
+  else
+    # Healthcheck failed — rollback (keep output visible during recovery)
+    warn "Healthcheck failed — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    compose_build || true
+    compose_up || true
+    vox_log_deploy "rollback" "$rollback_tag"
+    warn "Rolled back to $pre_sha"
+    return 1
+  fi
+}
+
+cmd_watch() {
+  local subcmd="${1:-start}"
+
+  case "$subcmd" in
+    stop)
+      local pidfile="$VOX_DIR/watch.pid"
+      if [[ -f "$pidfile" ]]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+          kill "$pid" 2>/dev/null || true
+          rm -f "$pidfile"
+          info "Watcher stopped (PID $pid)."
+        else
+          rm -f "$pidfile"
+          info "Watcher was not running (stale PID)."
+        fi
+      else
+        info "No watcher running."
+      fi
+      return 0
+      ;;
+    status)
+      local pidfile="$VOX_DIR/watch.pid"
+      if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        info "Watcher running (PID $(cat "$pidfile"))."
+      else
+        info "Watcher not running."
+      fi
+      return 0
+      ;;
+  esac
+
+  # ── Start the watch loop ──
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+
+  local interval="${VOX_WATCH_INTERVAL:-60}"
+  local pidfile="$VOX_DIR/watch.pid"
+
+  # Check for existing watcher
+  if [[ -f "$pidfile" ]]; then
+    local existing_pid
+    existing_pid=$(cat "$pidfile")
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      info "Watcher already running (PID $existing_pid). Use './vox watch stop' to stop it."
+      return 0
+    fi
+    rm -f "$pidfile"
+  fi
+
+  local logfile="$VOX_DIR/watch.log"
+
+  info "Starting autopull watcher (interval: ${interval}s)"
+  info "Deploys automatically on new commits or local-vs-deployed drift."
+  info "Log: $logfile"
+  info "Stop with: ./vox watch stop"
+
+  # Run the watch loop in a fully detached subshell:
+  #  - stdin from /dev/null so it survives terminal close
+  #  - stdout/stderr appended to .vox/watch.log so we have an audit trail
+  #  - nohup + disown so SIGHUP at terminal exit is ignored
+  #  - $BASHPID written to pidfile (bash's $$ inside () is the parent PID)
+  (
+    echo "$BASHPID" > "$pidfile"
+    trap 'rm -f "$pidfile"; exit 0' SIGTERM SIGINT
+
+    printf '[%s] watcher PID %s started, interval=%ss\n' "$(date -u +%FT%TZ)" "$BASHPID" "$interval"
+
+    while true; do
+      sleep "$interval"
+
+      if [[ ! -d "$REPO_PATH/.git" ]]; then
+        continue
+      fi
+
+      # Fetch and compare — support two triggers:
+      #   (a) origin ahead of local: classic push-from-elsewhere workflow.
+      #   (b) local ahead of last deploy: push-from-this-clone workflow, where
+      #       local HEAD and origin/$BRANCH go up in lockstep so the origin
+      #       comparison never fires. We keep a .vox/deployed.sha marker of
+      #       the last successfully-deployed SHA and redeploy whenever local
+      #       HEAD differs from it.
+      git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || continue
+      local local_sha remote_sha deployed_sha
+      local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+      remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
+      deployed_sha=""
+      if [[ -f "$VOX_DIR/deployed.sha" ]]; then
+        deployed_sha=$(cat "$VOX_DIR/deployed.sha" 2>/dev/null | tr -d '[:space:]' || true)
+      fi
+
+      local trigger=""
+      if [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
+        local behind
+        behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
+        trigger="origin-ahead ($behind commit(s))"
+      elif [[ -n "$local_sha" ]] && [[ -n "$deployed_sha" ]] && [[ "$local_sha" != "$deployed_sha" ]]; then
+        trigger="local-vs-deployed drift (local=${local_sha:0:8} deployed=${deployed_sha:0:8})"
+      fi
+
+      if [[ -n "$trigger" ]]; then
+        printf '[%s] [autopull] %s — deploying...\n' "$(date -u +%FT%TZ)" "$trigger"
+        if deploy_with_rollback; then
+          printf '[%s] [autopull] deploy ok HEAD=%s\n' "$(date -u +%FT%TZ)" "$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null)"
+        else
+          printf '[%s] [autopull] deploy failed, rolled back\n' "$(date -u +%FT%TZ)"
+        fi
+      fi
+    done
+  ) </dev/null >>"$logfile" 2>&1 &
+
+  disown
+  info "Watcher started in background (PID $!)."
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: destroy
+# ═════════════════════════════════════════════════════════════════════════════
+
+cmd_destroy() {
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  COMPOSE_CMD="${CFG_COMPOSE_CMD:-docker compose}"
+
+  echo ""
+  warn "This will stop and remove ALL vox-generated files from this directory."
+  warn "Project: $CFG_PROJECT_NAME  |  Repo: $REPO_PATH"
+  echo ""
+
+  if ! confirm "Are you SURE you want to destroy everything?"; then
+    info "Aborted."
+    return 0
+  fi
+
+  # Kill watcher if running
+  local pidfile="$VOX_DIR/watch.pid"
+  if [[ -f "$pidfile" ]]; then
+    local wpid
+    wpid=$(cat "$pidfile")
+    kill "$wpid" 2>/dev/null || true
+    rm -f "$pidfile"
+    info "Stopped autopull watcher."
+  fi
+
+  cd "$WORK_DIR"
+
+  # 1. Stop and remove containers, volumes, images
+  info "Taking down containers, volumes, and local images..."
+  $COMPOSE_CMD down --volumes --rmi local 2>/dev/null || true
+
+  # 2. Remove generated files inside the repo
+  if [[ -d "$REPO_PATH" ]]; then
+    info "Removing generated files from $CFG_REPO_DIR/..."
+    rm -f "$REPO_PATH/Dockerfile"
+    rm -f "$REPO_PATH/entrypoint.sh"
+    rm -f "$REPO_PATH/.dockerignore"
+    rm -f "$REPO_PATH/.env"
+  fi
+
+  # 3. Remove docker-compose.yml from working dir
+  rm -f "$WORK_DIR/docker-compose.yml"
+
+  # 4. Remove .cloudflared/ if present
+  rm -rf "$WORK_DIR/.cloudflared"
+
+  # 5. Remove .vox/ state
+  info "Removing .vox/ state..."
+  rm -rf "$VOX_DIR"
+
+  # 6. Remove the cloned repo
+  if [[ -d "$REPO_PATH" ]]; then
+    rm -rf "$REPO_PATH"
+    info "Removed $REPO_PATH"
+  fi
+
+  info "Destroy complete. Directory is clean."
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: help
+# ═════════════════════════════════════════════════════════════════════════════
+
+cmd_help() {
+  banner "vox — Deploy Any Repo"
+  box_line "Usage: ./vox <command> [options]"
+  box_line ""
+  box_line "One-liner deploy (no prompts):"
+  box_line "  ./vox setup --repo URL --token TOKEN --hostname DOMAIN"
+  box_line "  ./vox setup --repo URL --token TOKEN --hostname DOMAIN --env .env"
+  box_line "  ./vox setup --repo URL --token TOKEN --hostname DOMAIN --branch dev"
+  box_line ""
+  box_line "Commands:"
+  box_line "  setup               Interactive first-time setup"
+  box_line "  deploy              Pull latest + rebuild + zero-downtime restart"
+  box_line "  logs [--follow]     Show container logs"
+  box_line "  status              Show container health, uptime, current SHA"
+  box_line "  stop                Stop all services"
+  box_line "  start               Start services"
+  box_line "  restart             Restart services"
+  box_line "  rollback [n]        Roll back n deploys (default: 1)"
+  box_line "  env                 Show env vars (secrets masked)"
+  box_line "  env set KEY=VALUE   Add/update an env var and redeploy"
+  box_line "  env unset KEY       Remove an env var and redeploy"
+  box_line "  history             Show last 20 deploys"
+  box_line "  watch               Start autopull watcher (on by default after setup)"
+  box_line "  watch stop          Stop the autopull watcher"
+  box_line "  watch status        Check if watcher is running"
+  box_line "  destroy             Tear down everything (confirms first)"
+  box_line "  help                Show this message"
+  box_line ""
+  box_line "Setup flags:"
+  box_line "  --repo URL          Git repo URL"
+  box_line "  --token TOKEN       Cloudflare Tunnel token"
+  box_line "  --hostname DOMAIN   Public hostname (e.g. app.example.com)"
+  box_line "  --domain DOMAIN     Alias for --hostname"
+  box_line "  --env PATH          Path to .env file"
+  box_line "  --branch BRANCH     Git branch (default: main)"
+  box_line "  --autopull false    Disable auto-redeploy watcher"
+  box_line "  --skip-gpu          Skip NVIDIA Container Toolkit configuration"
+  box_render
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# COMMAND DISPATCHER
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Determine subcommand: first arg that does not look like a file path
+SUBCOMMAND="${1:-}"
+shift 2>/dev/null || true
+
+# Commands that need a live docker daemon. `help`, `history`, `env` (read),
+# and `watch stop/status` are intentionally excluded — they should work even
+# when docker is down so the user can diagnose the situation.
+case "$SUBCOMMAND" in
+  setup|deploy|logs|status|stop|start|restart|rollback|destroy)
+    require_docker
+    ;;
+  env)
+    # `env set` / `env unset` redeploy the container, so they need docker.
+    # Plain `env` (read-only display) does not.
+    case "${1:-}" in
+      set|unset) require_docker ;;
+    esac
+    ;;
+  watch)
+    # `watch start` forks a loop that calls docker; `watch stop`/`status` don't.
+    case "${1:-start}" in
+      start) require_docker ;;
+    esac
+    ;;
+esac
+
+case "$SUBCOMMAND" in
+  setup)
+    cmd_setup "$@"
+    ;;
+  deploy)
+    cmd_deploy "$@"
+    ;;
+  logs)
+    cmd_logs "$@"
+    ;;
+  status)
+    cmd_status "$@"
+    ;;
+  stop)
+    cmd_stop "$@"
+    ;;
+  start)
+    cmd_start "$@"
+    ;;
+  restart)
+    cmd_restart "$@"
+    ;;
+  rollback)
+    cmd_rollback "$@"
+    ;;
+  env)
+    cmd_env "$@"
+    ;;
+  history)
+    cmd_history "$@"
+    ;;
+  watch)
+    cmd_watch "$@"
+    ;;
+  destroy)
+    cmd_destroy "$@"
+    ;;
+  help|--help|-h)
+    cmd_help
+    ;;
+  "")
+    cmd_help
+    ;;
+  *)
+    err "Unknown command: $SUBCOMMAND"
+    echo ""
+    cmd_help
+    exit 1
+    ;;
+esac
