@@ -2705,6 +2705,8 @@ cmd_watch_loop() {
 
   local interval="${VOX_WATCH_INTERVAL:-60}"
   local pidfile="$VOX_DIR/watch.pid"
+  local unitfile="$VOX_DIR/watch.unit"
+  local unitfile="$VOX_DIR/watch.unit"
 
   echo "$$" > "$pidfile"
   trap 'rm -f "$pidfile"; exit 0' SIGTERM SIGINT
@@ -2784,6 +2786,17 @@ cmd_watch() {
   case "$subcmd" in
     stop)
       local pidfile="$VOX_DIR/watch.pid"
+      local unitfile="$VOX_DIR/watch.unit"
+      if [[ -f "$unitfile" ]]; then
+        local unit
+        unit=$(cat "$unitfile")
+        if systemctl --user stop "$unit" 2>/dev/null; then
+          rm -f "$unitfile" "$pidfile"
+          info "Watcher stopped ($unit)."
+          return 0
+        fi
+        rm -f "$unitfile"
+      fi
       if [[ -f "$pidfile" ]]; then
         local pid
         pid=$(cat "$pidfile")
@@ -2802,6 +2815,15 @@ cmd_watch() {
       ;;
     status)
       local pidfile="$VOX_DIR/watch.pid"
+      local unitfile="$VOX_DIR/watch.unit"
+      if [[ -f "$unitfile" ]]; then
+        local unit
+        unit=$(cat "$unitfile")
+        if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+          info "Watcher running ($unit)."
+          return 0
+        fi
+      fi
       if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
         info "Watcher running (PID $(cat "$pidfile"))."
       else
@@ -2818,6 +2840,7 @@ cmd_watch() {
 
   local interval="${VOX_WATCH_INTERVAL:-60}"
   local pidfile="$VOX_DIR/watch.pid"
+  local unitfile="$VOX_DIR/watch.unit"
 
   # Check for existing watcher
   if [[ -f "$pidfile" ]]; then
@@ -2836,6 +2859,26 @@ cmd_watch() {
   info "Deploys automatically on new commits or local-vs-deployed drift."
   info "Log: $logfile"
   info "Stop with: ./vox watch stop"
+
+  local script_path
+  script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  local unit_name
+  unit_name="vox-watch-$(basename "$WORK_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
+  if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+    systemctl --user stop "$unit_name.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$unit_name.service" >/dev/null 2>&1 || true
+    if systemd-run --user \
+      --unit="$unit_name" \
+      --property="WorkingDirectory=$WORK_DIR" \
+      --property="StandardOutput=append:$WORK_DIR/$logfile" \
+      --property="StandardError=append:$WORK_DIR/$logfile" \
+      /usr/bin/env VOX_WATCH_INTERVAL="$interval" "$script_path" __watch_loop >/dev/null; then
+      echo "$unit_name.service" > "$unitfile"
+      info "Watcher started as user service ($unit_name.service)."
+      return 0
+    fi
+    warn "systemd watcher start failed — falling back to nohup."
+  fi
 
   VOX_WATCH_INTERVAL="$interval" nohup "$0" __watch_loop </dev/null >>"$logfile" 2>&1 &
   local watcher_pid="$!"
