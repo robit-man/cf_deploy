@@ -2224,7 +2224,7 @@ cmd_deploy() {
 
   if wait_for_health "$app_container" 120; then
     vox_log_deploy "success" "$rollback_tag"
-    echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
+    record_deployed_repo_state "$REPO_PATH"
     box_line "Deploy successful"
     box_line "  Git SHA: ${git_sha:-(unknown)}"
     box_line "  Image:   $rollback_tag"
@@ -2574,6 +2574,33 @@ PYEOF
   echo ""
 }
 
+repo_state_fingerprint() {
+  local repo_path="$1"
+  [[ -d "$repo_path/.git" ]] || return 1
+
+  (
+    cd "$repo_path" || exit 1
+    {
+      git rev-parse HEAD 2>/dev/null || true
+      git status --porcelain=v1 -z --untracked-files=all 2>/dev/null || true
+      git diff --binary --no-ext-diff HEAD -- . 2>/dev/null || true
+      while IFS= read -r -d '' file; do
+        [[ -f "$file" ]] || continue
+        printf 'UNTRACKED:%s\0' "$file"
+        sha256sum "$file" 2>/dev/null || true
+      done < <(git ls-files --others --exclude-standard -z 2>/dev/null)
+    } | sha256sum | awk '{print $1}'
+  )
+}
+
+record_deployed_repo_state() {
+  local repo_path="$1"
+  if [[ -d "$repo_path/.git" ]]; then
+    git -C "$repo_path" rev-parse HEAD > "$VOX_DIR/deployed.sha" 2>/dev/null || true
+    repo_state_fingerprint "$repo_path" > "$VOX_DIR/deployed.state" 2>/dev/null || true
+  fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SUBCOMMAND: watch
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2592,6 +2619,10 @@ deploy_with_rollback() {
   # Save current state for rollback
   local pre_sha=""
   pre_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+  local pre_dirty="false"
+  if [[ -n "$(git -C "$REPO_PATH" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]]; then
+    pre_dirty="true"
+  fi
   local pre_image=""
   pre_image=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || true)
   local rollback_tag="${CFG_REPO_DIR}:rollback-$(date +%Y%m%d%H%M%S)"
@@ -2599,11 +2630,17 @@ deploy_with_rollback() {
     docker tag "$pre_image" "$rollback_tag" 2>/dev/null || true
   fi
 
-  # Pull — keep stderr visible so the user sees why a pull failed (auth, etc.)
-  info "Pulling latest from $CFG_REPO_BRANCH..."
-  if ! git -C "$REPO_PATH" pull --ff-only origin "$CFG_REPO_BRANCH"; then
-    warn "Git pull failed — aborting deploy, keeping current version."
-    return 1
+  # Pull only when the working tree is clean. In live-edit mode the watcher
+  # deploys uncommitted files; pulling over them would either fail or risk
+  # hiding the local source state that is supposed to go live.
+  if [[ "$pre_dirty" == "true" ]]; then
+    info "Working tree has local edits — skipping git pull and deploying local files."
+  else
+    info "Pulling latest from $CFG_REPO_BRANCH..."
+    if ! git -C "$REPO_PATH" pull --ff-only origin "$CFG_REPO_BRANCH"; then
+      warn "Git pull failed — aborting deploy, keeping current version."
+      return 1
+    fi
   fi
 
   local post_sha=""
@@ -2612,8 +2649,12 @@ deploy_with_rollback() {
   # Build — stream full output so build failures are diagnosable
   step "Auto-deploy phase 1/2: Build ($post_sha)"
   if ! compose_build; then
-    warn "Build failed — rolling back to $pre_sha..."
-    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    warn "Build failed — current running image is unchanged."
+    if [[ "$pre_dirty" != "true" ]]; then
+      git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    else
+      warn "Preserved local working-tree edits."
+    fi
     vox_log_deploy "build-failed" "$rollback_tag"
     return 1
   fi
@@ -2621,8 +2662,12 @@ deploy_with_rollback() {
   # Restart — stream output so start failures are visible
   step "Auto-deploy phase 2/2: Restart services"
   if ! compose_up; then
-    warn "Start failed after successful build — rolling back to $pre_sha..."
-    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    warn "Start failed after successful build — attempting service rollback."
+    if [[ "$pre_dirty" != "true" ]]; then
+      git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    else
+      warn "Preserved local working-tree edits."
+    fi
     compose_build || true
     compose_up || true
     vox_log_deploy "start-failed" "$rollback_tag"
@@ -2632,16 +2677,19 @@ deploy_with_rollback() {
   # Healthcheck
   if wait_for_health "$container_name" 120; then
     vox_log_deploy "success" "$rollback_tag"
-    # Record the currently-deployed SHA so the watch loop can detect drift
-    # between local HEAD and what's actually live, even when local == origin
-    # (i.e. when pushes are made from the same clone the watcher is in).
-    echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
+    # Record the exact deployed source state so the watch loop can detect
+    # both committed drift and uncommitted live-edit changes.
+    record_deployed_repo_state "$REPO_PATH"
     info "Deploy successful ($post_sha) — https://$CFG_HOSTNAME"
     return 0
   else
     # Healthcheck failed — rollback (keep output visible during recovery)
     warn "Healthcheck failed — rolling back to $pre_sha..."
-    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    if [[ "$pre_dirty" != "true" ]]; then
+      git -C "$REPO_PATH" reset --hard "$pre_sha" || true
+    else
+      warn "Preserved local working-tree edits."
+    fi
     compose_build || true
     compose_up || true
     vox_log_deploy "rollback" "$rollback_tag"
@@ -2727,32 +2775,51 @@ cmd_watch() {
         continue
       fi
 
-      # Fetch and compare — support two triggers:
+      # Fetch and compare — support three triggers:
       #   (a) origin ahead of local: classic push-from-elsewhere workflow.
       #   (b) local ahead of last deploy: push-from-this-clone workflow, where
       #       local HEAD and origin/$BRANCH go up in lockstep so the origin
       #       comparison never fires. We keep a .vox/deployed.sha marker of
       #       the last successfully-deployed SHA and redeploy whenever local
       #       HEAD differs from it.
+      #   (c) working tree content differs from the last deployed state:
+      #       live-edit workflow where files are modified but not committed.
       git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || continue
-      local local_sha remote_sha deployed_sha
+      local local_sha remote_sha deployed_sha local_state deployed_state dirty
       local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
       remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
       deployed_sha=""
       if [[ -f "$VOX_DIR/deployed.sha" ]]; then
         deployed_sha=$(cat "$VOX_DIR/deployed.sha" 2>/dev/null | tr -d '[:space:]' || true)
       fi
+      local_state=$(repo_state_fingerprint "$REPO_PATH" 2>/dev/null || true)
+      deployed_state=""
+      if [[ -f "$VOX_DIR/deployed.state" ]]; then
+        deployed_state=$(cat "$VOX_DIR/deployed.state" 2>/dev/null | tr -d '[:space:]' || true)
+      fi
+      dirty="false"
+      if [[ -n "$(git -C "$REPO_PATH" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]]; then
+        dirty="true"
+      fi
 
       local trigger=""
-      if [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
+      if [[ -n "$local_state" ]] && [[ -n "$deployed_state" ]] && [[ "$local_state" != "$deployed_state" ]]; then
+        if [[ "$dirty" == "true" ]]; then
+          trigger="working-tree drift (uncommitted local edits)"
+        else
+          trigger="local-vs-deployed drift (state=${local_state:0:8} deployed=${deployed_state:0:8})"
+        fi
+      elif [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
         local behind ahead
         behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
         ahead=$(git -C "$REPO_PATH" rev-list --count "origin/$CFG_REPO_BRANCH..HEAD" 2>/dev/null || echo 0)
-        if [[ "$ahead" -gt 0 ]]; then
+        if [[ "$ahead" -gt 0 ]] && [[ "$dirty" != "true" ]]; then
           printf '[%s] [autopull] local is %s commit(s) ahead of origin; skipping auto-pull\n' "$(date -u +%FT%TZ)" "$ahead"
           continue
         fi
-        trigger="origin-ahead ($behind commit(s))"
+        if [[ "$behind" -gt 0 ]]; then
+          trigger="origin-ahead ($behind commit(s))"
+        fi
       elif [[ -n "$local_sha" ]] && [[ -n "$deployed_sha" ]] && [[ "$local_sha" != "$deployed_sha" ]]; then
         trigger="local-vs-deployed drift (local=${local_sha:0:8} deployed=${deployed_sha:0:8})"
       fi
