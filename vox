@@ -2698,6 +2698,86 @@ deploy_with_rollback() {
   fi
 }
 
+cmd_watch_loop() {
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+
+  local interval="${VOX_WATCH_INTERVAL:-60}"
+  local pidfile="$VOX_DIR/watch.pid"
+
+  echo "$$" > "$pidfile"
+  trap 'rm -f "$pidfile"; exit 0' SIGTERM SIGINT
+
+  printf '[%s] watcher PID %s started, interval=%ss\n' "$(date -u +%FT%TZ)" "$$" "$interval"
+
+  while true; do
+    sleep "$interval"
+
+    if [[ ! -d "$REPO_PATH/.git" ]]; then
+      continue
+    fi
+
+    # Fetch and compare — support three triggers:
+    #   (a) origin ahead of local: classic push-from-elsewhere workflow.
+    #   (b) local ahead of last deploy: push-from-this-clone workflow, where
+    #       local HEAD and origin/$BRANCH go up in lockstep so the origin
+    #       comparison never fires. We keep a .vox/deployed.sha marker of
+    #       the last successfully-deployed SHA and redeploy whenever local
+    #       HEAD differs from it.
+    #   (c) working tree content differs from the last deployed state:
+    #       live-edit workflow where files are modified but not committed.
+    git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || continue
+    local local_sha remote_sha deployed_sha local_state deployed_state dirty
+    local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+    remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
+    deployed_sha=""
+    if [[ -f "$VOX_DIR/deployed.sha" ]]; then
+      deployed_sha=$(cat "$VOX_DIR/deployed.sha" 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    local_state=$(repo_state_fingerprint "$REPO_PATH" 2>/dev/null || true)
+    deployed_state=""
+    if [[ -f "$VOX_DIR/deployed.state" ]]; then
+      deployed_state=$(cat "$VOX_DIR/deployed.state" 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    dirty="false"
+    if [[ -n "$(git -C "$REPO_PATH" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]]; then
+      dirty="true"
+    fi
+
+    local trigger=""
+    if [[ -n "$local_state" ]] && [[ -n "$deployed_state" ]] && [[ "$local_state" != "$deployed_state" ]]; then
+      if [[ "$dirty" == "true" ]]; then
+        trigger="working-tree drift (uncommitted local edits)"
+      else
+        trigger="local-vs-deployed drift (state=${local_state:0:8} deployed=${deployed_state:0:8})"
+      fi
+    elif [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
+      local behind ahead
+      behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
+      ahead=$(git -C "$REPO_PATH" rev-list --count "origin/$CFG_REPO_BRANCH..HEAD" 2>/dev/null || echo 0)
+      if [[ "$ahead" -gt 0 ]] && [[ "$dirty" != "true" ]]; then
+        printf '[%s] [autopull] local is %s commit(s) ahead of origin; skipping auto-pull\n' "$(date -u +%FT%TZ)" "$ahead"
+        continue
+      fi
+      if [[ "$behind" -gt 0 ]]; then
+        trigger="origin-ahead ($behind commit(s))"
+      fi
+    elif [[ -n "$local_sha" ]] && [[ -n "$deployed_sha" ]] && [[ "$local_sha" != "$deployed_sha" ]]; then
+      trigger="local-vs-deployed drift (local=${local_sha:0:8} deployed=${deployed_sha:0:8})"
+    fi
+
+    if [[ -n "$trigger" ]]; then
+      printf '[%s] [autopull] %s — deploying...\n' "$(date -u +%FT%TZ)" "$trigger"
+      if deploy_with_rollback; then
+        printf '[%s] [autopull] deploy ok HEAD=%s\n' "$(date -u +%FT%TZ)" "$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null)"
+      else
+        printf '[%s] [autopull] deploy failed, rolled back\n' "$(date -u +%FT%TZ)"
+      fi
+    fi
+  done
+}
+
 cmd_watch() {
   local subcmd="${1:-start}"
 
@@ -2757,86 +2837,10 @@ cmd_watch() {
   info "Log: $logfile"
   info "Stop with: ./vox watch stop"
 
-  # Run the watch loop in a fully detached subshell:
-  #  - stdin from /dev/null so it survives terminal close
-  #  - stdout/stderr appended to .vox/watch.log so we have an audit trail
-  #  - nohup + disown so SIGHUP at terminal exit is ignored
-  #  - $BASHPID written to pidfile (bash's $$ inside () is the parent PID)
-  (
-    echo "$BASHPID" > "$pidfile"
-    trap 'rm -f "$pidfile"; exit 0' SIGTERM SIGINT
-
-    printf '[%s] watcher PID %s started, interval=%ss\n' "$(date -u +%FT%TZ)" "$BASHPID" "$interval"
-
-    while true; do
-      sleep "$interval"
-
-      if [[ ! -d "$REPO_PATH/.git" ]]; then
-        continue
-      fi
-
-      # Fetch and compare — support three triggers:
-      #   (a) origin ahead of local: classic push-from-elsewhere workflow.
-      #   (b) local ahead of last deploy: push-from-this-clone workflow, where
-      #       local HEAD and origin/$BRANCH go up in lockstep so the origin
-      #       comparison never fires. We keep a .vox/deployed.sha marker of
-      #       the last successfully-deployed SHA and redeploy whenever local
-      #       HEAD differs from it.
-      #   (c) working tree content differs from the last deployed state:
-      #       live-edit workflow where files are modified but not committed.
-      git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || continue
-      local local_sha remote_sha deployed_sha local_state deployed_state dirty
-      local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
-      remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
-      deployed_sha=""
-      if [[ -f "$VOX_DIR/deployed.sha" ]]; then
-        deployed_sha=$(cat "$VOX_DIR/deployed.sha" 2>/dev/null | tr -d '[:space:]' || true)
-      fi
-      local_state=$(repo_state_fingerprint "$REPO_PATH" 2>/dev/null || true)
-      deployed_state=""
-      if [[ -f "$VOX_DIR/deployed.state" ]]; then
-        deployed_state=$(cat "$VOX_DIR/deployed.state" 2>/dev/null | tr -d '[:space:]' || true)
-      fi
-      dirty="false"
-      if [[ -n "$(git -C "$REPO_PATH" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]]; then
-        dirty="true"
-      fi
-
-      local trigger=""
-      if [[ -n "$local_state" ]] && [[ -n "$deployed_state" ]] && [[ "$local_state" != "$deployed_state" ]]; then
-        if [[ "$dirty" == "true" ]]; then
-          trigger="working-tree drift (uncommitted local edits)"
-        else
-          trigger="local-vs-deployed drift (state=${local_state:0:8} deployed=${deployed_state:0:8})"
-        fi
-      elif [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
-        local behind ahead
-        behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
-        ahead=$(git -C "$REPO_PATH" rev-list --count "origin/$CFG_REPO_BRANCH..HEAD" 2>/dev/null || echo 0)
-        if [[ "$ahead" -gt 0 ]] && [[ "$dirty" != "true" ]]; then
-          printf '[%s] [autopull] local is %s commit(s) ahead of origin; skipping auto-pull\n' "$(date -u +%FT%TZ)" "$ahead"
-          continue
-        fi
-        if [[ "$behind" -gt 0 ]]; then
-          trigger="origin-ahead ($behind commit(s))"
-        fi
-      elif [[ -n "$local_sha" ]] && [[ -n "$deployed_sha" ]] && [[ "$local_sha" != "$deployed_sha" ]]; then
-        trigger="local-vs-deployed drift (local=${local_sha:0:8} deployed=${deployed_sha:0:8})"
-      fi
-
-      if [[ -n "$trigger" ]]; then
-        printf '[%s] [autopull] %s — deploying...\n' "$(date -u +%FT%TZ)" "$trigger"
-        if deploy_with_rollback; then
-          printf '[%s] [autopull] deploy ok HEAD=%s\n' "$(date -u +%FT%TZ)" "$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null)"
-        else
-          printf '[%s] [autopull] deploy failed, rolled back\n' "$(date -u +%FT%TZ)"
-        fi
-      fi
-    done
-  ) </dev/null >>"$logfile" 2>&1 &
-
-  disown
-  info "Watcher started in background (PID $!)."
+  VOX_WATCH_INTERVAL="$interval" nohup "$0" __watch_loop </dev/null >>"$logfile" 2>&1 &
+  local watcher_pid="$!"
+  echo "$watcher_pid" > "$pidfile"
+  info "Watcher started in background (PID $watcher_pid)."
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2959,7 +2963,7 @@ shift 2>/dev/null || true
 # and `watch stop/status` are intentionally excluded — they should work even
 # when docker is down so the user can diagnose the situation.
 case "$SUBCOMMAND" in
-  setup|deploy|logs|status|stop|start|restart|rollback|destroy)
+  setup|deploy|logs|status|stop|start|restart|rollback|destroy|__watch_loop)
     require_docker
     ;;
   env)
@@ -3010,6 +3014,9 @@ case "$SUBCOMMAND" in
     ;;
   watch)
     cmd_watch "$@"
+    ;;
+  __watch_loop)
+    cmd_watch_loop
     ;;
   destroy)
     cmd_destroy "$@"
