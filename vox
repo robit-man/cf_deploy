@@ -19,7 +19,11 @@ set -euo pipefail
 #   ./vox env unset K    # Remove an env var and redeploy
 #   ./vox destroy        # Tear down everything
 #   ./vox history        # Show deploy history
-#   ./vox watch          # Start auto-redeploy watcher
+#   ./vox watch                  # Start auto-redeploy watcher (fg-detached)
+#   ./vox watch stop|status      # Manage the watcher
+#   ./vox watch logs [--follow]  # Tail the watcher log
+#   ./vox watch once             # One fetch + deploy-if-needed (cron/webhook)
+#   ./vox watch install-service  # systemd unit so watcher survives reboots
 #   ./vox help           # Show usage
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -214,7 +218,76 @@ compose_down() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUDO HELPERS — never let `sudo` silently hang the script.
+# INSTALL HELPERS — run install_cmd when lockfiles change (package updates)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Hash a lockfile (or empty string if missing) for change detection.
+hash_lockfile() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    sha256sum "$f" 2>/dev/null | awk '{print $1}' || true
+  fi
+}
+
+# Run the project's install command if lockfiles have changed since last deploy.
+# Returns 0 on success or when skipped, 1 on failure.
+run_install_if_needed() {
+  local repo_path="$1"
+  local install_cmd="$2"
+  local force="${3:-}"
+
+  if [[ -z "$install_cmd" ]]; then
+    return 0
+  fi
+
+  local hash_file="$VOX_DIR/last-install-hash"
+  local current_hash=""
+
+  # Detect lockfiles in priority order
+  local lockfiles=(
+    "$repo_path/package-lock.json"
+    "$repo_path/pnpm-lock.yaml"
+    "$repo_path/yarn.lock"
+    "$repo_path/bun.lockb"
+    "$repo_path/bun.lock"
+    "$repo_path/Cargo.lock"
+    "$repo_path/Pipfile.lock"
+    "$repo_path/poetry.lock"
+    "$repo_path/go.sum"
+    "$repo_path/Gemfile.lock"
+    "$repo_path/composer.lock"
+  )
+
+  for lf in "${lockfiles[@]}"; do
+    if [[ -f "$lf" ]]; then
+      current_hash="${current_hash}$(hash_lockfile "$lf")"
+    fi
+  done
+
+  local last_hash=""
+  if [[ -f "$hash_file" ]]; then
+    last_hash=$(cat "$hash_file" 2>/dev/null || true)
+  fi
+
+  if [[ "$force" == "force" ]] || [[ "$current_hash" != "$last_hash" ]]; then
+    info "Lockfile change detected — running install command..."
+    info "  $install_cmd"
+    set +e
+    (cd "$repo_path" && eval "$install_cmd")
+    local rc=$?
+    set -e
+    if [[ "$rc" -eq 0 ]]; then
+      echo "$current_hash" > "$hash_file"
+      info "Install completed successfully"
+      return 0
+    else
+      err "Install command failed (exit $rc)"
+      return 1
+    fi
+  fi
+
+  return 0
+}
 # `sudo` writes its password prompt to /dev/tty by default, so redirecting
 # stderr to /dev/null does NOT hide the prompt — but it DOES hide every other
 # diagnostic, which made earlier silent hangs impossible to debug. We split
@@ -1436,6 +1509,42 @@ VOX_DIR=".vox"
 VOX_CONFIG="$VOX_DIR/config.json"
 VOX_DEPLOYS="$VOX_DIR/deploys"
 
+vox_config_repo_dir() {
+  local config_path="$1"
+  python3 - "$config_path" <<'PYEOF' 2>/dev/null || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as f:
+        print(json.load(f).get("repo_dir", ""))
+except Exception:
+    print("")
+PYEOF
+}
+
+# The tracked vox script lives inside some repos, while the deploy state lives
+# beside the repo. Resolve that parent deploy root before loading config.
+vox_enter_work_dir() {
+  local cwd parent repo_dir
+  cwd="$(pwd)"
+
+  if [[ -f "$cwd/$VOX_CONFIG" ]]; then
+    return 0
+  fi
+
+  parent="$(cd "$cwd/.." && pwd)"
+  if [[ -f "$parent/$VOX_CONFIG" ]]; then
+    repo_dir=$(vox_config_repo_dir "$parent/$VOX_CONFIG")
+    if [[ -n "$repo_dir" ]] && [[ "$parent/$repo_dir" -ef "$cwd" ]]; then
+      cd "$parent"
+      return 0
+    fi
+  fi
+
+  return 0
+}
+
 vox_init_dirs() {
   mkdir -p "$VOX_DIR" "$VOX_DEPLOYS"
 }
@@ -1456,6 +1565,7 @@ cfg = {
     "type":                  "$7",
     "base_image":            "$8",
     "install_cmd":           "$9",
+    "auto_install":          "${17}",
     "build_cmd":             "${10}",
     "start_cmd":             "${11}",
     "data_dirs":             "${12}",
@@ -1486,6 +1596,8 @@ except Exception:
 
 # Load all config keys into shell variables
 vox_load_config() {
+  vox_enter_work_dir
+
   if [[ ! -f "$VOX_CONFIG" ]]; then
     err "No config found at $VOX_CONFIG. Run './vox setup' first."
     exit 1
@@ -1497,10 +1609,34 @@ vox_load_config() {
   CFG_HOSTNAME=$(vox_config_get "hostname")
   CFG_TYPE=$(vox_config_get "type")
   CFG_COMPOSE_CMD=$(vox_config_get "compose_cmd")
+  CFG_INSTALL_CMD=$(vox_config_get "install_cmd")
+  CFG_AUTO_INSTALL=$(vox_config_get "auto_install")
 
   WORK_DIR="$(pwd)"
   REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
   COMPOSE_CMD="${CFG_COMPOSE_CMD:-docker compose}"
+}
+
+vox_maybe_load_config() {
+  vox_enter_work_dir
+
+  if [[ -f "$VOX_CONFIG" ]]; then
+    vox_load_config
+    return 0
+  fi
+
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR"
+  CFG_PROJECT_NAME=""
+  CFG_REPO_BRANCH=""
+  CFG_REPO_DIR=""
+  CFG_HOSTNAME=""
+  CFG_TYPE=""
+  CFG_COMPOSE_CMD="docker compose"
+  CFG_INSTALL_CMD=""
+  CFG_AUTO_INSTALL=""
+  COMPOSE_CMD="$CFG_COMPOSE_CMD"
+  return 1
 }
 
 # Detect compose command (used during setup before config exists)
@@ -1603,6 +1739,7 @@ cmd_setup() {
       --env)      IMPORTED_ENV_FILE="$2"; shift 2 ;;
       --branch)   CLI_BRANCH="$2"; shift 2 ;;
       --autopull) CLI_AUTOPULL="$2"; shift 2 ;;
+      --auto-install) CLI_AUTO_INSTALL="$2"; shift 2 ;;
       --skip-gpu) SKIP_GPU="true"; shift ;;
       *)
         # Bare arg — check if it's a file (drag-and-drop .env)
@@ -1809,7 +1946,7 @@ cmd_setup() {
     if confirm "Pull latest from $REPO_BRANCH?"; then
       git -C "$REPO_PATH" fetch origin
       git -C "$REPO_PATH" checkout "$REPO_BRANCH"
-      git -C "$REPO_PATH" pull --ff-only origin "$REPO_BRANCH"
+      git -C "$REPO_PATH" pull origin "$REPO_BRANCH"
     fi
   elif [[ -d "$REPO_PATH" ]] && [[ ! -d "$REPO_PATH/.git" ]]; then
     # Local path, not a git repo — use as-is
@@ -1870,6 +2007,7 @@ cmd_setup() {
         ask DETECTED_START_CMD   "Start command"       "$DETECTED_START_CMD"
         ask DETECTED_PORT        "Port"                "$DETECTED_PORT"
         ask DETECTED_DATA_DIRS   "Data dirs (space-separated, for volumes)" "$DETECTED_DATA_DIRS"
+        ask AUTO_INSTALL         "Auto-install deps on lockfile change? (true/false)" "true"
       fi
     fi
   else
@@ -1893,6 +2031,7 @@ cmd_setup() {
         ask DETECTED_START_CMD   "Start command (e.g. npm start, python app.py)" ""
         ask DETECTED_PORT        "Port the app listens on" "3000"
         ask DETECTED_DATA_DIRS   "Persistent data dirs (blank if none)" ""
+        ask AUTO_INSTALL         "Auto-install deps on lockfile change? (true/false)" "true"
       fi
     else
       box_line "Common base images:"
@@ -1906,6 +2045,7 @@ cmd_setup() {
       ask DETECTED_START_CMD   "Start command" ""
       ask DETECTED_PORT        "Port" "3000"
       ask DETECTED_DATA_DIRS   "Persistent data dirs (blank if none)" ""
+      ask AUTO_INSTALL         "Auto-install deps on lockfile change? (true/false)" "true"
       DETECTED_IGNORE_PATTERNS=".git\n.env.local"
     fi
   fi
@@ -2084,7 +2224,8 @@ CFGEOF
     "$tunnel_method" \
     "$USE_EXISTING_DOCKERFILE" \
     "$(date -Iseconds)" \
-    "$COMPOSE_CMD"
+    "$COMPOSE_CMD" \
+    "${AUTO_INSTALL:-}"
 
   # ── Tag first image for rollback support ──
   local image_tag
@@ -2156,8 +2297,22 @@ CFGEOF
   # ── Auto-start watcher (default on, disable with --autopull false) ──
   if [[ "$CLI_AUTOPULL" == "true" ]]; then
     info "Starting autopull watcher (monitors repo for changes)..."
-    cmd_watch start
-    info "Disable with: ./vox watch stop  |  Skip at setup: --autopull false"
+    # Prefer the systemd-managed watcher so it survives reboots and auto-
+    # restarts on crash. Fall back to the detached background loop if systemd
+    # is unavailable or install fails (e.g. no passwordless sudo).
+    local installed_service=0
+    if command -v systemctl >/dev/null 2>&1; then
+      if cmd_watch_install_service; then
+        installed_service=1
+      else
+        warn "Could not install systemd service — falling back to detached watcher."
+      fi
+    fi
+    if [[ "$installed_service" == "0" ]]; then
+      cmd_watch_start
+      info "For reboot-persistent auto-deploy, run: ./vox watch install-service"
+    fi
+    info "Disable with: ./vox watch stop   |   Skip at setup: --autopull false"
   fi
 
   banner "Done"
@@ -2177,9 +2332,17 @@ cmd_deploy() {
   # 1. Pull latest code
   if [[ -d "$REPO_PATH/.git" ]]; then
     info "Pulling latest from $CFG_REPO_BRANCH..."
-    git -C "$REPO_PATH" pull --ff-only origin "$CFG_REPO_BRANCH"
+    git -C "$REPO_PATH" pull origin "$CFG_REPO_BRANCH"
   else
     info "No git repo at $REPO_PATH — skipping pull"
+  fi
+
+  # 1b. Auto-install dependencies if lockfiles changed (or forced)
+  if [[ "${CFG_AUTO_INSTALL:-}" == "true" ]] || [[ "${CLI_AUTO_INSTALL:-}" == "true" ]]; then
+    if ! run_install_if_needed "$REPO_PATH" "$CFG_INSTALL_CMD" "${CLI_AUTO_INSTALL:-}"; then
+      err "Dependency install failed — aborting deploy to avoid broken build."
+      exit 1
+    fi
   fi
 
   # 2. Tag current running image as rollback target
@@ -2224,7 +2387,7 @@ cmd_deploy() {
 
   if wait_for_health "$app_container" 120; then
     vox_log_deploy "success" "$rollback_tag"
-    record_deployed_repo_state "$REPO_PATH"
+    echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
     box_line "Deploy successful"
     box_line "  Git SHA: ${git_sha:-(unknown)}"
     box_line "  Image:   $rollback_tag"
@@ -2574,33 +2737,6 @@ PYEOF
   echo ""
 }
 
-repo_state_fingerprint() {
-  local repo_path="$1"
-  [[ -d "$repo_path/.git" ]] || return 1
-
-  (
-    cd "$repo_path" || exit 1
-    {
-      git rev-parse HEAD 2>/dev/null || true
-      git status --porcelain=v1 -z --untracked-files=all 2>/dev/null || true
-      git diff --binary --no-ext-diff HEAD -- . 2>/dev/null || true
-      while IFS= read -r -d '' file; do
-        [[ -f "$file" ]] || continue
-        printf 'UNTRACKED:%s\0' "$file"
-        sha256sum "$file" 2>/dev/null || true
-      done < <(git ls-files --others --exclude-standard -z 2>/dev/null)
-    } | sha256sum | awk '{print $1}'
-  )
-}
-
-record_deployed_repo_state() {
-  local repo_path="$1"
-  if [[ -d "$repo_path/.git" ]]; then
-    git -C "$repo_path" rev-parse HEAD > "$VOX_DIR/deployed.sha" 2>/dev/null || true
-    repo_state_fingerprint "$repo_path" > "$VOX_DIR/deployed.state" 2>/dev/null || true
-  fi
-}
-
 # ═════════════════════════════════════════════════════════════════════════════
 # SUBCOMMAND: watch
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2619,10 +2755,6 @@ deploy_with_rollback() {
   # Save current state for rollback
   local pre_sha=""
   pre_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
-  local pre_dirty="false"
-  if [[ -n "$(git -C "$REPO_PATH" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]]; then
-    pre_dirty="true"
-  fi
   local pre_image=""
   pre_image=$(docker inspect --format='{{.Image}}' "$container_name" 2>/dev/null || true)
   local rollback_tag="${CFG_REPO_DIR}:rollback-$(date +%Y%m%d%H%M%S)"
@@ -2630,31 +2762,29 @@ deploy_with_rollback() {
     docker tag "$pre_image" "$rollback_tag" 2>/dev/null || true
   fi
 
-  # Pull only when the working tree is clean. In live-edit mode the watcher
-  # deploys uncommitted files; pulling over them would either fail or risk
-  # hiding the local source state that is supposed to go live.
-  if [[ "$pre_dirty" == "true" ]]; then
-    info "Working tree has local edits — skipping git pull and deploying local files."
-  else
-    info "Pulling latest from $CFG_REPO_BRANCH..."
-    if ! git -C "$REPO_PATH" pull --ff-only origin "$CFG_REPO_BRANCH"; then
-      warn "Git pull failed — aborting deploy, keeping current version."
-      return 1
-    fi
+  # Pull — keep stderr visible so the user sees why a pull failed (auth, etc.)
+  info "Pulling latest from $CFG_REPO_BRANCH..."
+  if ! git -C "$REPO_PATH" pull origin "$CFG_REPO_BRANCH"; then
+    warn "Git pull failed — aborting deploy, keeping current version."
+    return 1
   fi
 
   local post_sha=""
   post_sha=$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null || true)
 
+  # Auto-install dependencies if lockfiles changed (or forced)
+  if [[ "${CFG_AUTO_INSTALL:-}" == "true" ]] || [[ "${CLI_AUTO_INSTALL:-}" == "true" ]]; then
+    if ! run_install_if_needed "$REPO_PATH" "$CFG_INSTALL_CMD" "${CLI_AUTO_INSTALL:-}"; then
+      warn "Dependency install failed — aborting auto-deploy, keeping current version."
+      return 1
+    fi
+  fi
+
   # Build — stream full output so build failures are diagnosable
   step "Auto-deploy phase 1/2: Build ($post_sha)"
   if ! compose_build; then
-    warn "Build failed — current running image is unchanged."
-    if [[ "$pre_dirty" != "true" ]]; then
-      git -C "$REPO_PATH" reset --hard "$pre_sha" || true
-    else
-      warn "Preserved local working-tree edits."
-    fi
+    warn "Build failed — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
     vox_log_deploy "build-failed" "$rollback_tag"
     return 1
   fi
@@ -2662,12 +2792,8 @@ deploy_with_rollback() {
   # Restart — stream output so start failures are visible
   step "Auto-deploy phase 2/2: Restart services"
   if ! compose_up; then
-    warn "Start failed after successful build — attempting service rollback."
-    if [[ "$pre_dirty" != "true" ]]; then
-      git -C "$REPO_PATH" reset --hard "$pre_sha" || true
-    else
-      warn "Preserved local working-tree edits."
-    fi
+    warn "Start failed after successful build — rolling back to $pre_sha..."
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
     compose_build || true
     compose_up || true
     vox_log_deploy "start-failed" "$rollback_tag"
@@ -2677,19 +2803,16 @@ deploy_with_rollback() {
   # Healthcheck
   if wait_for_health "$container_name" 120; then
     vox_log_deploy "success" "$rollback_tag"
-    # Record the exact deployed source state so the watch loop can detect
-    # both committed drift and uncommitted live-edit changes.
-    record_deployed_repo_state "$REPO_PATH"
+    # Record the currently-deployed SHA so the watch loop can detect drift
+    # between local HEAD and what's actually live, even when local == origin
+    # (i.e. when pushes are made from the same clone the watcher is in).
+    echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
     info "Deploy successful ($post_sha) — https://$CFG_HOSTNAME"
     return 0
   else
     # Healthcheck failed — rollback (keep output visible during recovery)
     warn "Healthcheck failed — rolling back to $pre_sha..."
-    if [[ "$pre_dirty" != "true" ]]; then
-      git -C "$REPO_PATH" reset --hard "$pre_sha" || true
-    else
-      warn "Preserved local working-tree edits."
-    fi
+    git -C "$REPO_PATH" reset --hard "$pre_sha" || true
     compose_build || true
     compose_up || true
     vox_log_deploy "rollback" "$rollback_tag"
@@ -2698,192 +2821,660 @@ deploy_with_rollback() {
   fi
 }
 
-cmd_watch_loop() {
-  vox_load_config
-  WORK_DIR="$(pwd)"
-  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+watch_log() {
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"
+}
 
-  local interval="${VOX_WATCH_INTERVAL:-60}"
-  local pidfile="$VOX_DIR/watch.pid"
-  local unitfile="$VOX_DIR/watch.unit"
-  local unitfile="$VOX_DIR/watch.unit"
+# Build the systemd unit name (one service per project directory).
+watch_sanitize_name() {
+  local raw="${1:-vox}"
+  local safe
+  safe=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\+/-/g;s/^-\+//;s/-\+$//')
+  [[ -z "$safe" ]] && safe="vox"
+  echo "$safe"
+}
 
-  echo "$$" > "$pidfile"
-  trap 'rm -f "$pidfile"; exit 0' SIGTERM SIGINT
+watch_service_name() {
+  local project="${CFG_PROJECT_NAME:-$(basename "$(pwd)")}"
+  local safe
+  safe=$(watch_sanitize_name "$project")
+  echo "vox-watch-${safe}"
+}
 
-  printf '[%s] watcher PID %s started, interval=%ss\n' "$(date -u +%FT%TZ)" "$$" "$interval"
+watch_service_candidates() {
+  local primary stored fallback
+  primary="$(watch_service_name).service"
+  echo "$primary"
 
+  if [[ -f "$VOX_DIR/watch.unit" ]]; then
+    stored=$(tr -d '[:space:]' < "$VOX_DIR/watch.unit" 2>/dev/null || true)
+    if [[ -n "$stored" ]]; then
+      [[ "$stored" != *.service ]] && stored="${stored}.service"
+      [[ "$stored" != "$primary" ]] && echo "$stored"
+    fi
+  fi
+
+  fallback="vox-watch-$(watch_sanitize_name "$(basename "$(pwd)")").service"
+  [[ "$fallback" != "$primary" ]] && echo "$fallback"
+}
+
+systemd_unit_known() {
+  local unit="$1"
+  systemctl list-unit-files "$unit" --no-pager --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "$unit" && return 0
+  systemctl list-units --all "$unit" --no-pager --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "$unit"
+}
+
+vox_script_path() {
+  # The systemd unit must re-invoke THIS exact script — the one that wrote the
+  # unit and owns .vox/. Earlier versions preferred $REPO_PATH/vox, which
+  # silently picked up any stale copy of vox that happened to be checked into
+  # the deployed repo. That stale copy then ran from systemd instead of the
+  # patched parent, producing a confusing zombie watcher that exited 0 on
+  # every tick and never deployed anything.
+  local self
+  self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
+  if [[ -n "$self" ]] && [[ -x "$self" ]]; then
+    echo "$self"
+    return 0
+  fi
+  local work_script="$WORK_DIR/vox"
+  if [[ -x "$work_script" ]]; then
+    echo "$work_script"
+    return 0
+  fi
+  if [[ -n "${REPO_PATH:-}" ]] && [[ -x "$REPO_PATH/vox" ]]; then
+    echo "$REPO_PATH/vox"
+    return 0
+  fi
+  echo "$work_script"
+}
+
+# Run one fetch-and-deploy-if-needed check. Stays quiet when there is nothing
+# to do so it is safe to call frequently from cron / webhooks.
+#   0 = no change or successful deploy
+#   1 = deploy was triggered but failed (and rolled back)
+#   2 = fetch/comparison failed (transient — retry next tick)
+watch_check_once() {
+  if [[ ! -d "$REPO_PATH/.git" ]]; then
+    watch_log "[autopull] skip: $REPO_PATH is not a git checkout"
+    return 2
+  fi
+
+  # Fetch the tracked branch. Capture stderr for visibility when it fails
+  # (network hiccup, expired creds, upstream missing, etc).
+  local fetch_err
+  if ! fetch_err=$(git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>&1); then
+    watch_log "[autopull] fetch failed: ${fetch_err:-unknown error}"
+    return 2
+  fi
+
+  local local_sha remote_sha deployed_sha
+  local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+  remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
+  deployed_sha=""
+  if [[ -f "$VOX_DIR/deployed.sha" ]]; then
+    deployed_sha=$(cat "$VOX_DIR/deployed.sha" 2>/dev/null | tr -d '[:space:]' || true)
+  fi
+
+  # First-run bootstrap: seed deployed.sha to the current HEAD so the
+  # local-vs-deployed branch below can detect drift from the very first push.
+  # Without this, a push from this same clone (where local == origin after the
+  # push) would be invisible on the first tick after the watcher starts.
+  if [[ -z "$deployed_sha" ]] && [[ -n "$local_sha" ]]; then
+    echo "$local_sha" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
+    deployed_sha="$local_sha"
+  fi
+
+  local trigger=""
+  if [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
+    local behind
+    behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
+    trigger="origin-ahead (${behind} commit(s) behind ${CFG_REPO_BRANCH})"
+  elif [[ -n "$local_sha" ]] && [[ -n "$deployed_sha" ]] && [[ "$local_sha" != "$deployed_sha" ]]; then
+    trigger="local-vs-deployed drift (local=${local_sha:0:8} deployed=${deployed_sha:0:8})"
+  fi
+
+  if [[ -z "$trigger" ]]; then
+    return 0
+  fi
+
+  watch_log "[autopull] $trigger — deploying..."
+  if deploy_with_rollback; then
+    watch_log "[autopull] deploy ok HEAD=$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null)"
+    return 0
+  else
+    watch_log "[autopull] deploy failed, rolled back"
+    return 1
+  fi
+}
+
+watch_loop() {
+  local interval="${VOX_WATCH_INTERVAL:-15}"
+  watch_log "watcher PID $$ started, interval=${interval}s, repo=$REPO_PATH, branch=$CFG_REPO_BRANCH"
+  # Propagate SIGTERM from systemd / `watch stop` into a clean exit.
+  trap 'watch_log "watcher received signal, exiting"; exit 0' TERM INT HUP
   while true; do
-    sleep "$interval"
-
-    if [[ ! -d "$REPO_PATH/.git" ]]; then
-      continue
-    fi
-
-    # Fetch and compare — support three triggers:
-    #   (a) origin ahead of local: classic push-from-elsewhere workflow.
-    #   (b) local ahead of last deploy: push-from-this-clone workflow, where
-    #       local HEAD and origin/$BRANCH go up in lockstep so the origin
-    #       comparison never fires. We keep a .vox/deployed.sha marker of
-    #       the last successfully-deployed SHA and redeploy whenever local
-    #       HEAD differs from it.
-    #   (c) working tree content differs from the last deployed state:
-    #       live-edit workflow where files are modified but not committed.
-    git -C "$REPO_PATH" fetch origin "$CFG_REPO_BRANCH" --quiet 2>/dev/null || continue
-    local local_sha remote_sha deployed_sha local_state deployed_state dirty
-    local_sha=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
-    remote_sha=$(git -C "$REPO_PATH" rev-parse "origin/$CFG_REPO_BRANCH" 2>/dev/null || true)
-    deployed_sha=""
-    if [[ -f "$VOX_DIR/deployed.sha" ]]; then
-      deployed_sha=$(cat "$VOX_DIR/deployed.sha" 2>/dev/null | tr -d '[:space:]' || true)
-    fi
-    local_state=$(repo_state_fingerprint "$REPO_PATH" 2>/dev/null || true)
-    deployed_state=""
-    if [[ -f "$VOX_DIR/deployed.state" ]]; then
-      deployed_state=$(cat "$VOX_DIR/deployed.state" 2>/dev/null | tr -d '[:space:]' || true)
-    fi
-    dirty="false"
-    if [[ -n "$(git -C "$REPO_PATH" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]]; then
-      dirty="true"
-    fi
-
-    local trigger=""
-    if [[ -n "$local_state" ]] && [[ -n "$deployed_state" ]] && [[ "$local_state" != "$deployed_state" ]]; then
-      if [[ "$dirty" == "true" ]]; then
-        trigger="working-tree drift (uncommitted local edits)"
-      else
-        trigger="local-vs-deployed drift (state=${local_state:0:8} deployed=${deployed_state:0:8})"
-      fi
-    elif [[ -n "$local_sha" ]] && [[ -n "$remote_sha" ]] && [[ "$local_sha" != "$remote_sha" ]]; then
-      local behind ahead
-      behind=$(git -C "$REPO_PATH" rev-list --count "HEAD..origin/$CFG_REPO_BRANCH" 2>/dev/null || echo 0)
-      ahead=$(git -C "$REPO_PATH" rev-list --count "origin/$CFG_REPO_BRANCH..HEAD" 2>/dev/null || echo 0)
-      if [[ "$ahead" -gt 0 ]] && [[ "$dirty" != "true" ]]; then
-        printf '[%s] [autopull] local is %s commit(s) ahead of origin; skipping auto-pull\n' "$(date -u +%FT%TZ)" "$ahead"
-        continue
-      fi
-      if [[ "$behind" -gt 0 ]]; then
-        trigger="origin-ahead ($behind commit(s))"
-      fi
-    elif [[ -n "$local_sha" ]] && [[ -n "$deployed_sha" ]] && [[ "$local_sha" != "$deployed_sha" ]]; then
-      trigger="local-vs-deployed drift (local=${local_sha:0:8} deployed=${deployed_sha:0:8})"
-    fi
-
-    if [[ -n "$trigger" ]]; then
-      printf '[%s] [autopull] %s — deploying...\n' "$(date -u +%FT%TZ)" "$trigger"
-      if deploy_with_rollback; then
-        printf '[%s] [autopull] deploy ok HEAD=%s\n' "$(date -u +%FT%TZ)" "$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null)"
-      else
-        printf '[%s] [autopull] deploy failed, rolled back\n' "$(date -u +%FT%TZ)"
-      fi
-    fi
+    watch_check_once || true
+    # Plain sleep — trap handlers still fire after sleep returns, so shutdown
+    # latency is bounded by $interval. systemd TimeoutStopSec=15 covers it.
+    sleep "$interval" || true
   done
 }
 
-cmd_watch() {
-  local subcmd="${1:-start}"
+cmd_watch_stop() {
+  vox_maybe_load_config || true
 
-  case "$subcmd" in
-    stop)
-      local pidfile="$VOX_DIR/watch.pid"
-      local unitfile="$VOX_DIR/watch.unit"
-      if [[ -f "$unitfile" ]]; then
-        local unit
-        unit=$(cat "$unitfile")
-        if systemctl --user stop "$unit" 2>/dev/null; then
-          rm -f "$unitfile" "$pidfile"
-          info "Watcher stopped ($unit)."
-          return 0
-        fi
-        rm -f "$unitfile"
-      fi
-      if [[ -f "$pidfile" ]]; then
-        local pid
-        pid=$(cat "$pidfile")
-        if kill -0 "$pid" 2>/dev/null; then
-          kill "$pid" 2>/dev/null || true
-          rm -f "$pidfile"
-          info "Watcher stopped (PID $pid)."
+  # Stop systemd-managed instance if present...
+  local svc seen_units=" "
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    [[ "$seen_units" == *" $svc "* ]] && continue
+    seen_units="${seen_units}${svc} "
+    if systemd_unit_known "$svc"; then
+      # Try non-interactive first; if that fails, escalate to an interactive
+      # prompt so the user can actually stop the service when they ask to.
+      ensure_sudo auto || true
+      if ! sudo_run 15 systemctl stop "$svc" >/dev/null 2>&1; then
+        ensure_sudo interactive || true
+        if ! sudo_run 15 systemctl stop "$svc" >/dev/null 2>&1; then
+          warn "Could not stop systemd service $svc. Try: sudo systemctl stop $svc"
         else
-          rm -f "$pidfile"
-          info "Watcher was not running (stale PID)."
+          info "Stopped systemd service $svc."
         fi
       else
-        info "No watcher running."
+        info "Stopped systemd service $svc."
       fi
-      return 0
-      ;;
-    status)
-      local pidfile="$VOX_DIR/watch.pid"
-      local unitfile="$VOX_DIR/watch.unit"
-      if [[ -f "$unitfile" ]]; then
-        local unit
-        unit=$(cat "$unitfile")
-        if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
-          info "Watcher running ($unit)."
-          return 0
-        fi
-      fi
-      if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-        info "Watcher running (PID $(cat "$pidfile"))."
-      else
-        info "Watcher not running."
-      fi
-      return 0
-      ;;
-  esac
+    fi
+  done < <(watch_service_candidates)
 
-  # ── Start the watch loop ──
+  # ...then the local pidfile-managed instance.
+  local pidfile="$VOX_DIR/watch.pid"
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      # Give it a couple of seconds to exit cleanly.
+      local i
+      for i in 1 2 3 4 5; do
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        sleep 1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      rm -f "$pidfile"
+      info "Watcher stopped (PID $pid)."
+    else
+      rm -f "$pidfile"
+      info "Watcher was not running (stale PID)."
+    fi
+  fi
+  return 0
+}
+
+cmd_watch_status() {
+  vox_maybe_load_config || true
+
+  local any=0
+  local svc seen_units=" "
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    [[ "$seen_units" == *" $svc "* ]] && continue
+    seen_units="${seen_units}${svc} "
+    if systemd_unit_known "$svc"; then
+      any=1
+      local state
+      state=$(systemctl is-active "$svc" 2>/dev/null || true)
+      local enabled
+      enabled=$(systemctl is-enabled "$svc" 2>/dev/null || true)
+      info "systemd: $svc — active=${state:-unknown} enabled=${enabled:-unknown}"
+    fi
+  done < <(watch_service_candidates)
+
+  local pidfile="$VOX_DIR/watch.pid"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    any=1
+    info "local: watcher running (PID $(cat "$pidfile"))."
+  fi
+
+  if [[ "$any" == "0" ]]; then
+    info "Watcher not running."
+  fi
+  return 0
+}
+
+# Reconciler: detect "watcher should be alive but isn't" and self-heal silently
+# where possible. Designed to be called at the top of any non-destructive
+# command (deploy, status, start, restart, watch) without slowing it down or
+# prompting for credentials. Returns 0 always; never blocks the caller.
+#
+#   - Clean up stale pidfile from a dead detached watcher.
+#   - If a systemd unit is installed but inactive, try a non-interactive
+#     `sudo -n systemctl start` (silently no-ops if sudo creds aren't cached).
+#   - If no persistent watcher exists at all (no systemd unit, no live pidfile),
+#     print a one-line actionable warning. We do NOT auto-install systemd here
+#     because that needs sudo and would interrupt every `./vox deploy`.
+watch_ensure_alive() {
+  # Only meaningful once setup has run.
+  vox_maybe_load_config || return 0
+  [[ -z "${CFG_PROJECT_NAME:-}" ]] && return 0
+  vox_init_dirs 2>/dev/null || return 0
+
+  local pidfile="$VOX_DIR/watch.pid"
+  local svc
+  svc=$(watch_service_name)
+
+  # 1. Reap any stale pidfile from a dead detached watcher.
+  if [[ -f "$pidfile" ]]; then
+    local existing_pid
+    existing_pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -z "$existing_pid" ]] || ! kill -0 "$existing_pid" 2>/dev/null; then
+      rm -f "$pidfile" 2>/dev/null || true
+    fi
+  fi
+
+  # 2. If the systemd unit exists, that is the source of truth.
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemd_unit_known "${svc}.service"; then
+      if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+        return 0
+      fi
+      # Unit exists but isn't running. Try a quiet, non-interactive recover.
+      if sudo -n systemctl start "${svc}.service" >/dev/null 2>&1; then
+        info "Auto-healed: started inactive systemd watcher ${svc}.service."
+      else
+        warn "systemd watcher ${svc}.service is installed but not active."
+        warn "Recover with: sudo systemctl start ${svc}.service"
+      fi
+      return 0
+    fi
+  fi
+
+  # 3. Live detached watcher? Acceptable but not reboot-safe.
+  if [[ -f "$pidfile" ]]; then
+    return 0
+  fi
+
+  # 4. Nothing is running and nothing is installed. Warn once per invocation.
+  if [[ "${VOX_WATCH_QUIET:-0}" == "1" ]]; then
+    return 0
+  fi
+  warn "Autopull watcher is NOT running and no persistent service is installed."
+  warn "Recover with: ./vox watch start    (installs systemd unit; survives reboot)"
+  return 0
+}
+
+cmd_watch_repair() {
   vox_load_config
   WORK_DIR="$(pwd)"
   REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  vox_init_dirs
 
-  local interval="${VOX_WATCH_INTERVAL:-60}"
+  local svc
+  svc=$(watch_service_name)
+
+  info "Reconciling watcher state for ${svc}..."
+
+  # Always reap stale pidfile first.
   local pidfile="$VOX_DIR/watch.pid"
-  local unitfile="$VOX_DIR/watch.unit"
-
-  # Check for existing watcher
   if [[ -f "$pidfile" ]]; then
     local existing_pid
-    existing_pid=$(cat "$pidfile")
-    if kill -0 "$existing_pid" 2>/dev/null; then
+    existing_pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -z "$existing_pid" ]] || ! kill -0 "$existing_pid" 2>/dev/null; then
+      rm -f "$pidfile"
+      info "Cleared stale pidfile (PID ${existing_pid:-?} was dead)."
+    fi
+  fi
+
+  # Prefer systemd path.
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemd_unit_known "${svc}.service"; then
+      if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+        info "systemd watcher ${svc}.service is already active. Nothing to do."
+        return 0
+      fi
+      info "systemd unit exists but inactive — starting it."
+      if ensure_sudo interactive && sudo_run 15 systemctl start "${svc}.service"; then
+        info "Started ${svc}.service."
+        return 0
+      fi
+      err "Could not start ${svc}.service. Try: sudo systemctl status ${svc}.service"
+      return 1
+    fi
+    info "No systemd unit installed — installing now."
+    cmd_watch_install_service
+    return $?
+  fi
+
+  warn "systemctl not available — falling back to detached watcher."
+  cmd_watch_start --detached
+  return $?
+}
+
+cmd_watch_logs() {
+  vox_maybe_load_config || true
+
+  local follow=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow="--follow"; shift ;;
+      *) shift ;;
+    esac
+  done
+  local logfile="$VOX_DIR/watch.log"
+  if [[ ! -f "$logfile" ]]; then
+    info "No watcher log at $logfile yet."
+    return 0
+  fi
+  if [[ -n "$follow" ]]; then
+    tail -n 200 -F "$logfile"
+  else
+    tail -n 200 "$logfile"
+  fi
+}
+
+cmd_watch_once() {
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  vox_init_dirs
+  watch_check_once
+  return $?
+}
+
+cmd_watch_install_service() {
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  vox_init_dirs
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    err "systemctl not found. Install the watcher manually via './vox watch start'."
+    return 1
+  fi
+
+  # Cache sudo credentials up-front; writing a unit file + daemon-reload needs
+  # root. Interactive prompt here means the rest of this function can rely on
+  # sudo_run succeeding without blocking.
+  if ! ensure_sudo interactive; then
+    err "Root access required to install systemd unit. Falling back: './vox watch start'"
+    return 1
+  fi
+
+  local svc
+  svc=$(watch_service_name)
+  local unit_path="/etc/systemd/system/${svc}.service"
+  local script_path
+  script_path=$(vox_script_path)
+  local run_user="${VOX_SERVICE_USER:-${SUDO_USER:-$USER}}"
+  [[ -z "$run_user" ]] && run_user=$(id -un)
+  local interval="${VOX_WATCH_INTERVAL:-15}"
+  local logfile="$(cd "$WORK_DIR" && pwd)/$VOX_DIR/watch.log"
+  local workdir="$(cd "$WORK_DIR" && pwd)"
+
+  if [[ ! -x "$script_path" ]]; then
+    err "vox script not executable at $script_path"
+    return 1
+  fi
+
+  info "Installing systemd service $unit_path (user=$run_user, interval=${interval}s)"
+
+  local tmp_unit
+  tmp_unit=$(mktemp)
+  cat > "$tmp_unit" <<UNIT
+[Unit]
+Description=vox autopull watcher for ${CFG_PROJECT_NAME:-$svc}
+After=docker.service docker.socket network-online.target
+Wants=network-online.target docker.socket
+Requires=docker.service
+# Never give up restarting — without these, systemd stops trying after 5
+# restarts in 10s (the default StartLimit), which silently disables the
+# watcher exactly when it is most needed (transient docker / network /
+# git failures during boot).
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=${run_user}
+WorkingDirectory=${workdir}
+Environment=VOX_WATCH_INTERVAL=${interval}
+Environment=HOME=$(getent passwd "$run_user" | cut -d: -f6 2>/dev/null || echo "/home/$run_user")
+ExecStart=${script_path} watch start --foreground
+# Restart on any exit (success, failure, signal, OOM, watchdog).
+Restart=always
+RestartSec=5
+# Reap child processes (docker compose, git) cleanly on stop/restart.
+KillMode=mixed
+StandardOutput=append:${logfile}
+StandardError=append:${logfile}
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  if ! sudo_run 15 cp "$tmp_unit" "$unit_path"; then
+    rm -f "$tmp_unit"
+    err "Failed to write $unit_path — needs sudo. Re-run with sudo cached (sudo -v) or as root."
+    return 1
+  fi
+  rm -f "$tmp_unit"
+  sudo_run 15 chmod 0644 "$unit_path" >/dev/null 2>&1 || true
+
+  local current_unit="${svc}.service"
+  local old_svc seen_units=" "
+  while IFS= read -r old_svc; do
+    [[ -z "$old_svc" ]] && continue
+    [[ "$seen_units" == *" $old_svc "* ]] && continue
+    seen_units="${seen_units}${old_svc} "
+    [[ "$old_svc" == "$current_unit" ]] && continue
+    if systemd_unit_known "$old_svc"; then
+      warn "Removing stale watcher service $old_svc"
+      sudo_run 15 systemctl disable --now "$old_svc" >/dev/null 2>&1 || true
+      sudo_run 15 rm -f "/etc/systemd/system/$old_svc" >/dev/null 2>&1 || true
+    fi
+  done < <(watch_service_candidates)
+
+  if ! sudo_run 15 systemctl daemon-reload; then
+    err "systemctl daemon-reload failed."
+    return 1
+  fi
+
+  # Stop any foreground/local watcher so we don't double-deploy.
+  cmd_watch_stop >/dev/null 2>&1 || true
+
+  if ! sudo_run 15 systemctl enable "${svc}.service"; then
+    err "systemctl enable ${svc}.service failed."
+    return 1
+  fi
+
+  if ! sudo_run 30 systemctl restart "${svc}.service"; then
+    err "systemctl restart ${svc}.service failed. Check: sudo journalctl -u ${svc}.service -n 80"
+    return 1
+  fi
+
+  echo "${svc}.service" > "$VOX_DIR/watch.unit" 2>/dev/null || true
+  info "Installed & started ${svc}.service (auto-starts on boot)."
+  info "Logs:   ./vox watch logs --follow    (or: journalctl -u ${svc}.service -f)"
+  info "Status: ./vox watch status"
+}
+
+cmd_watch_uninstall_service() {
+  vox_maybe_load_config || true
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    info "systemctl not present — nothing to uninstall."
+    return 0
+  fi
+  ensure_sudo interactive || {
+    err "Root access required to remove systemd unit."
+    return 1
+  }
+  local svc seen_units=" "
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    [[ "$seen_units" == *" $svc "* ]] && continue
+    seen_units="${seen_units}${svc} "
+    local unit_path="/etc/systemd/system/${svc}"
+
+    sudo_run 15 systemctl disable --now "$svc" >/dev/null 2>&1 || true
+    if [[ -f "$unit_path" ]]; then
+      if sudo_run 15 rm -f "$unit_path"; then
+        info "Removed $unit_path."
+      else
+        warn "Could not remove $unit_path (needs sudo)."
+      fi
+    fi
+  done < <(watch_service_candidates)
+  rm -f "$VOX_DIR/watch.unit" 2>/dev/null || true
+  sudo_run 15 systemctl daemon-reload >/dev/null 2>&1 || true
+  info "Uninstalled watcher service."
+}
+
+cmd_watch_start() {
+  local foreground=""
+  local force_detached=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--foreground) foreground="1"; shift ;;
+      --detached|--no-systemd) force_detached="1"; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  vox_load_config
+  WORK_DIR="$(pwd)"
+  REPO_PATH="$WORK_DIR/$CFG_REPO_DIR"
+  vox_init_dirs
+
+  local interval="${VOX_WATCH_INTERVAL:-15}"
+  local pidfile="$VOX_DIR/watch.pid"
+  local logfile="$VOX_DIR/watch.log"
+  local svc
+  svc=$(watch_service_name)
+
+  # CRITICAL: --foreground must short-circuit BEFORE any "is the systemd
+  # unit active?" check. systemd invokes us with --foreground, so we ARE
+  # that unit — detecting ourselves and exiting 0 produces an infinite
+  # restart loop that never deploys anything (the exact failure mode that
+  # killed the watcher on this host until the bug was fixed).
+  if [[ -n "$foreground" ]]; then
+    echo "$$" > "$pidfile"
+    trap 'rm -f "$pidfile"' EXIT
+    watch_loop
+    return $?
+  fi
+
+  # Guard against double-start (interactive paths only).
+  if [[ -f "$pidfile" ]]; then
+    local existing_pid
+    existing_pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
       info "Watcher already running (PID $existing_pid). Use './vox watch stop' to stop it."
       return 0
     fi
     rm -f "$pidfile"
   fi
 
-  local logfile="$VOX_DIR/watch.log"
-
-  info "Starting autopull watcher (interval: ${interval}s)"
-  info "Deploys automatically on new commits or local-vs-deployed drift."
-  info "Log: $logfile"
-  info "Stop with: ./vox watch stop"
-
-  local script_path
-  script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  local unit_name
-  unit_name="vox-watch-$(basename "$WORK_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
-  if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-    systemctl --user stop "$unit_name.service" >/dev/null 2>&1 || true
-    systemctl --user reset-failed "$unit_name.service" >/dev/null 2>&1 || true
-    if systemd-run --user \
-      --unit="$unit_name" \
-      --property="WorkingDirectory=$WORK_DIR" \
-      --property="StandardOutput=append:$WORK_DIR/$logfile" \
-      --property="StandardError=append:$WORK_DIR/$logfile" \
-      /usr/bin/env VOX_WATCH_INTERVAL="$interval" "$script_path" __watch_loop >/dev/null; then
-      echo "$unit_name.service" > "$unitfile"
-      info "Watcher started as user service ($unit_name.service)."
-      return 0
-    fi
-    warn "systemd watcher start failed — falling back to nohup."
+  # Also guard against the systemd-managed copy running, so we don't fork two
+  # watchers fighting over the same repo (interactive paths only).
+  if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+    info "systemd service ${svc}.service is active — nothing to do."
+    info "To stop it:    sudo systemctl stop ${svc}.service   (or ./vox watch stop)"
+    info "To uninstall:  ./vox watch uninstall-service"
+    return 0
   fi
 
-  VOX_WATCH_INTERVAL="$interval" nohup "$0" __watch_loop </dev/null >>"$logfile" 2>&1 &
-  local watcher_pid="$!"
-  echo "$watcher_pid" > "$pidfile"
-  info "Watcher started in background (PID $watcher_pid)."
+  # Default path: install/restart the systemd unit so the watcher survives
+  # reboots, OOMs, and session teardown. A detached userspace fork is the
+  # historical default but cannot satisfy the "always alive" guarantee — it
+  # dies the moment the user logs out or the machine reboots. systemd's
+  # Restart=always with no rate limit is the only mechanism that actually
+  # self-heals. Detached fork remains a last-resort fallback.
+  if [[ -z "$force_detached" ]] && command -v systemctl >/dev/null 2>&1; then
+    if cmd_watch_install_service; then
+      return 0
+    fi
+    warn "systemd install failed — falling back to detached watcher (will NOT survive reboot)."
+    warn "Re-run with sudo cached (sudo -v) and './vox watch start' to retry persistent install."
+  fi
+
+  info "Starting autopull watcher (interval: ${interval}s)"
+  info "Deploys on origin-ahead OR local-vs-deployed drift."
+  info "Log:    $logfile"
+  info "Stop:   ./vox watch stop"
+  info "Persist across reboots: ./vox watch install-service"
+
+  # Fully detach: setsid creates a new session so SIGHUP from the parent shell
+  # does not reach the loop. nohup is a belt-and-braces fallback when setsid
+  # is unavailable (BSD-ish environments).
+  local launcher=""
+  if command -v setsid >/dev/null 2>&1; then
+    launcher="setsid"
+  elif command -v nohup >/dev/null 2>&1; then
+    launcher="nohup"
+  fi
+
+  local script_path
+  script_path=$(vox_script_path)
+
+  if [[ -n "$launcher" ]]; then
+    $launcher bash -c "cd '$WORK_DIR' && exec '$script_path' watch start --foreground" \
+      </dev/null >>"$logfile" 2>&1 &
+  else
+    # Last-resort path: bare subshell with disown.
+    (
+      cd "$WORK_DIR"
+      exec "$script_path" watch start --foreground
+    ) </dev/null >>"$logfile" 2>&1 &
+    disown
+  fi
+  local launched_pid=$!
+
+  # Give the child a beat to write its own pidfile.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if [[ -f "$pidfile" ]]; then break; fi
+    sleep 0.2
+  done
+
+  if [[ -f "$pidfile" ]]; then
+    info "Watcher started (PID $(cat "$pidfile"))."
+  else
+    info "Watcher launched (PID $launched_pid) — check $logfile if nothing happens."
+  fi
+}
+
+cmd_watch() {
+  local subcmd="${1:-start}"
+  case "$subcmd" in
+    start|stop|status|once|logs|install-service|uninstall-service|repair)
+      shift 2>/dev/null || true
+      ;;
+    -f|--foreground)
+      subcmd="start"
+      # keep flag for cmd_watch_start to see
+      ;;
+    *)
+      err "Unknown watch subcommand: $subcmd"
+      echo "Available: start | stop | status | once | logs | repair | install-service | uninstall-service"
+      return 1
+      ;;
+  esac
+
+  case "$subcmd" in
+    start)             cmd_watch_start "$@" ;;
+    stop)              cmd_watch_stop "$@" ;;
+    status)            cmd_watch_status "$@" ;;
+    once)              cmd_watch_once "$@" ;;
+    logs)              cmd_watch_logs "$@" ;;
+    repair)            cmd_watch_repair "$@" ;;
+    install-service)   cmd_watch_install_service "$@" ;;
+    uninstall-service) cmd_watch_uninstall_service "$@" ;;
+  esac
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2976,9 +3567,11 @@ cmd_help() {
   box_line "  env set KEY=VALUE   Add/update an env var and redeploy"
   box_line "  env unset KEY       Remove an env var and redeploy"
   box_line "  history             Show last 20 deploys"
-  box_line "  watch               Start autopull watcher (on by default after setup)"
-  box_line "  watch stop          Stop the autopull watcher"
-  box_line "  watch status        Check if watcher is running"
+  box_line "  watch                       Start autopull watcher (on by default after setup)"
+  box_line "  watch stop|status|logs      Manage the running watcher"
+  box_line "  watch once                  Run one fetch + deploy-if-needed (cron/webhook)"
+  box_line "  watch install-service       Install systemd unit so watcher survives reboots"
+  box_line "  watch uninstall-service     Remove the systemd unit"
   box_line "  destroy             Tear down everything (confirms first)"
   box_line "  help                Show this message"
   box_line ""
@@ -2990,6 +3583,7 @@ cmd_help() {
   box_line "  --env PATH          Path to .env file"
   box_line "  --branch BRANCH     Git branch (default: main)"
   box_line "  --autopull false    Disable auto-redeploy watcher"
+  box_line "  --auto-install true Enable auto-install on lockfile change"
   box_line "  --skip-gpu          Skip NVIDIA Container Toolkit configuration"
   box_render
 }
@@ -3006,7 +3600,7 @@ shift 2>/dev/null || true
 # and `watch stop/status` are intentionally excluded — they should work even
 # when docker is down so the user can diagnose the situation.
 case "$SUBCOMMAND" in
-  setup|deploy|logs|status|stop|start|restart|rollback|destroy|__watch_loop)
+  setup|deploy|logs|status|stop|start|restart|rollback|destroy)
     require_docker
     ;;
   env)
@@ -3017,10 +3611,22 @@ case "$SUBCOMMAND" in
     esac
     ;;
   watch)
-    # `watch start` forks a loop that calls docker; `watch stop`/`status` don't.
+    # Only branches that actually invoke docker need the gate. `once` still
+    # triggers a deploy, so it needs docker too.
     case "${1:-start}" in
-      start) require_docker ;;
+      start|once|install-service) require_docker ;;
     esac
+    ;;
+esac
+
+# Self-heal the autopull watcher on any command that implies the service
+# should be running. Cheap and silent when state is correct; warns or auto-
+# starts the systemd unit when it isn't. Excluded: setup (manages the watcher
+# itself), stop, destroy, uninstall, watch (handles its own state), help,
+# history (read-only).
+case "$SUBCOMMAND" in
+  deploy|status|start|restart|rollback|logs|env)
+    watch_ensure_alive || true
     ;;
 esac
 
@@ -3057,9 +3663,6 @@ case "$SUBCOMMAND" in
     ;;
   watch)
     cmd_watch "$@"
-    ;;
-  __watch_loop)
-    cmd_watch_loop
     ;;
   destroy)
     cmd_destroy "$@"
