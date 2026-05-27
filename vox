@@ -654,10 +654,22 @@ print(f'main:{d.get(\"main\", \"\")}')
       detect "Will use --ignore-scripts for Docker layer caching"
     fi
 
+    # ── Lockfile-drift-tolerant install command ──
+    # Strict-lockfile mode (`npm ci`, `pnpm --frozen-lockfile`, `yarn
+    # --frozen-lockfile`) is the right default for reproducible images —
+    # but it makes the whole deploy fail any time a dep version is bumped
+    # in the manifest without re-running the host install to refresh the
+    # lockfile. That has caused production retry loops here (omnius 1.0.199
+    # in lock vs 1.0.200 in package.json triggered every-15s build failures
+    # for an hour until manually fixed). Each command therefore falls back
+    # to a permissive install on strict-mode failure, with a logged warning
+    # so the drift is visible in build logs. The warning text "[vox]"
+    # prefix and "lockfile likely drifted" phrase are grepped by ops, so
+    # don't reword without updating dashboards.
     case "$pkg_mgr" in
-      pnpm) DETECTED_INSTALL_CMD="pnpm install --frozen-lockfile --ignore-scripts" ;;
-      yarn) DETECTED_INSTALL_CMD="yarn install --frozen-lockfile --ignore-scripts" ;;
-      *)    DETECTED_INSTALL_CMD="npm ci --ignore-scripts --legacy-peer-deps" ;;
+      pnpm) DETECTED_INSTALL_CMD='pnpm install --frozen-lockfile --ignore-scripts || (echo "[vox] pnpm frozen-lockfile failed (lockfile likely drifted) — falling back to pnpm install" && pnpm install --ignore-scripts)' ;;
+      yarn) DETECTED_INSTALL_CMD='yarn install --frozen-lockfile --ignore-scripts || (echo "[vox] yarn frozen-lockfile failed (lockfile likely drifted) — falling back to yarn install" && yarn install --ignore-scripts)' ;;
+      *)    DETECTED_INSTALL_CMD='npm ci --ignore-scripts --legacy-peer-deps || (echo "[vox] npm ci failed (lockfile likely drifted) — falling back to npm install" && npm install --ignore-scripts --legacy-peer-deps --no-audit --no-fund)' ;;
     esac
 
     if echo "$DETECTED_BASE_IMAGE" | grep -q "slim\|debian\|ubuntu"; then
@@ -1700,6 +1712,11 @@ COMPHEAD
     if [[ "$use_host_network" -eq 1 ]]; then
       echo "    network_mode: host"
     fi
+
+    # cloudflared fails against some host stub resolvers from host-networked containers.
+    echo "    dns:"
+    echo "      - 1.1.1.1"
+    echo "      - 1.0.0.1"
 
     echo "    environment:"
     echo "      PORT: \"${app_port}\""
@@ -3096,13 +3113,25 @@ deploy_with_rollback() {
     return 1
   fi
 
-  local post_sha=""
+  local post_sha="" post_sha_full=""
   post_sha=$(git -C "$REPO_PATH" rev-parse --short HEAD 2>/dev/null || true)
+  post_sha_full=$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)
+
+  # When a deploy fails below we record post_sha_full into
+  # .vox/last-failed.sha so watch_check_once can refuse to redeploy the
+  # same broken commit on every tick. Helper inlined here so each failure
+  # path is a one-liner.
+  _vox_mark_failed_sha() {
+    [[ -n "$post_sha_full" ]] || return 0
+    mkdir -p "$VOX_DIR" 2>/dev/null || true
+    echo "$post_sha_full" > "$VOX_DIR/last-failed.sha" 2>/dev/null || true
+  }
 
   # Auto-install dependencies if lockfiles changed (or forced)
   if [[ "${CFG_AUTO_INSTALL:-}" == "true" ]] || [[ "${CLI_AUTO_INSTALL:-}" == "true" ]]; then
     if ! run_install_if_needed "$REPO_PATH" "$CFG_INSTALL_CMD" "${CLI_AUTO_INSTALL:-}"; then
       warn "Dependency install failed — aborting auto-deploy, keeping current version."
+      _vox_mark_failed_sha
       return 1
     fi
   fi
@@ -3113,6 +3142,7 @@ deploy_with_rollback() {
     warn "Build failed — rolling back to $pre_sha..."
     git -C "$REPO_PATH" reset --hard "$pre_sha" || true
     vox_log_deploy "build-failed" "$rollback_tag"
+    _vox_mark_failed_sha
     return 1
   fi
 
@@ -3124,6 +3154,7 @@ deploy_with_rollback() {
     compose_build || true
     compose_up || true
     vox_log_deploy "start-failed" "$rollback_tag"
+    _vox_mark_failed_sha
     return 1
   fi
 
@@ -3134,6 +3165,8 @@ deploy_with_rollback() {
     # between local HEAD and what's actually live, even when local == origin
     # (i.e. when pushes are made from the same clone the watcher is in).
     echo "$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || true)" > "$VOX_DIR/deployed.sha" 2>/dev/null || true
+    # Clear the failure marker — this SHA is now known-good.
+    rm -f "$VOX_DIR/last-failed.sha" "$VOX_DIR/last-failed.notified" 2>/dev/null || true
     info "Deploy successful ($post_sha) — https://$CFG_HOSTNAME"
     return 0
   else
@@ -3143,6 +3176,7 @@ deploy_with_rollback() {
     compose_build || true
     compose_up || true
     vox_log_deploy "rollback" "$rollback_tag"
+    _vox_mark_failed_sha
     warn "Rolled back to $pre_sha"
     return 1
   fi
@@ -3262,6 +3296,26 @@ watch_check_once() {
   fi
 
   if [[ -z "$trigger" ]]; then
+    return 0
+  fi
+
+  # ── Stuck-SHA guard ──
+  # deploy_with_rollback writes .vox/last-failed.sha (full SHA) on every
+  # failure path. If origin still points at that exact SHA, refuse to
+  # redeploy on this tick — wait for origin to advance past the broken
+  # commit (or for the operator to delete the marker). Without this we
+  # burned an hour of CPU rebuilding the same broken commit every 15s.
+  # Logged once per stuck SHA via .vox/last-failed.notified, not every
+  # tick, so the watcher log stays readable.
+  local last_failed=""
+  [[ -f "$VOX_DIR/last-failed.sha" ]] && last_failed=$(cat "$VOX_DIR/last-failed.sha" 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -n "$last_failed" ]] && [[ "$last_failed" == "$remote_sha" ]]; then
+    local notified=""
+    [[ -f "$VOX_DIR/last-failed.notified" ]] && notified=$(cat "$VOX_DIR/last-failed.notified" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "$notified" != "$last_failed" ]]; then
+      watch_log "[autopull] holding back: origin ${last_failed:0:8} previously failed to deploy — waiting for a new commit (or 'rm $VOX_DIR/last-failed.sha') before retrying. See $VOX_DIR/build.log for the failure."
+      echo "$last_failed" > "$VOX_DIR/last-failed.notified" 2>/dev/null || true
+    fi
     return 0
   fi
 
