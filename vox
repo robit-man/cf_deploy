@@ -193,6 +193,14 @@ compose_up() {
       set -e
     fi
   fi
+  if [[ "$rc" -ne 0 ]] && echo "$output" | grep -qiE 'address already in use|port is already allocated|bind.*failed|listen EADDRINUSE'; then
+    warn "A tracked port appears occupied; releasing this vox project's stale containers and retrying once"
+    compose_release_project_resources
+    set +e
+    $COMPOSE_CMD up -d --remove-orphans "$@" 2>&1
+    rc=$?
+    set -e
+  fi
   if [[ "$rc" -eq 0 ]]; then
     stream_close "up ok" "$GREEN"
   else
@@ -206,7 +214,7 @@ compose_down() {
   info "Stopping services (streaming output below)"
   stream_open "docker compose down"
   set +e
-  $COMPOSE_CMD down "$@" 2>&1
+  $COMPOSE_CMD down --remove-orphans "$@" 2>&1
   local rc=$?
   set -e
   if [[ "$rc" -eq 0 ]]; then
@@ -215,6 +223,27 @@ compose_down() {
     stream_close "down FAILED (exit $rc)" "$RED"
   fi
   return "$rc"
+}
+
+compose_project_name() {
+  local dir
+  dir="${WORK_DIR:-$(pwd)}"
+  basename "$dir" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-'
+}
+
+compose_release_project_resources() {
+  local project
+  project="$(compose_project_name)"
+
+  set +e
+  $COMPOSE_CMD down --remove-orphans --timeout 20 >/dev/null 2>&1
+  docker ps -aq \
+    --filter "label=com.docker.compose.project=${project}" \
+    --filter "status=exited" \
+    --filter "status=created" \
+    --filter "status=dead" \
+    | xargs -r docker rm -f >/dev/null 2>&1
+  set -e
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1483,13 +1512,51 @@ random_hex() {
   fi
 }
 
+yaml_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+docker_host_url() {
+  local value="$1"
+  value="${value//127.0.0.1/host.docker.internal}"
+  value="${value//localhost/host.docker.internal}"
+  printf '%s\n' "$value"
+}
+
+is_loopback_url() {
+  local value="$1"
+  [[ "$value" == *"127.0.0.1"* || "$value" == *"localhost"* ]]
+}
+
+port_is_listening() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "( sport = :$port )" 2>/dev/null | grep -q LISTEN
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+choose_host_port() {
+  local port="$1"
+  while port_is_listening "$port"; do
+    port=$((port + 1))
+  done
+  printf '%s\n' "$port"
+}
+
 generate_compose() {
   local outfile="$1" repo_dir="$2"
   local container_name
   container_name=$(echo "$repo_dir" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
 
   # ── App + cloudflared tunnel, with optional managed backing services ──
-  local needs_postgres=0 needs_redis=0 skip_local_services=0
+  local needs_postgres=0 needs_redis=0 skip_local_services=0 use_host_network=0 needs_host_gateway=0
   local repo_path="$WORK_DIR/$repo_dir"
   local pkg="$repo_path/package.json"
 
@@ -1507,6 +1574,32 @@ generate_compose() {
 
   if [[ -f "$repo_path/scripts/ensure-services.sh" ]] || { [[ -f "$pkg" ]] && grep -q "services:ensure" "$pkg"; }; then
     skip_local_services=1
+  fi
+
+  local host_url_key host_url_value
+  for host_url_key in OMNIUS_BASE_URL OA_BASE_URL LLM_BASE_URL; do
+    host_url_value="$(env_var_value "$host_url_key" 2>/dev/null || true)"
+    if [[ -n "$host_url_value" ]] && is_loopback_url "$host_url_value"; then
+      use_host_network=1
+    fi
+  done
+
+  local app_port="$DETECTED_PORT"
+  local pg_host_port="15432"
+  local redis_host_port="16379"
+  if [[ "$use_host_network" -eq 1 ]]; then
+    app_port="$(choose_host_port "$app_port")"
+    pg_host_port="$(choose_host_port "$pg_host_port")"
+    redis_host_port="$(choose_host_port "$redis_host_port")"
+    if [[ "$app_port" != "$DETECTED_PORT" ]]; then
+      warn "Port $DETECTED_PORT is already in use; using $app_port for the host-network app container"
+    fi
+    if [[ "$needs_postgres" -eq 1 && "$pg_host_port" != "15432" ]]; then
+      warn "Postgres helper port 15432 is already in use; using $pg_host_port"
+    fi
+    if [[ "$needs_redis" -eq 1 && "$redis_host_port" != "16379" ]]; then
+      warn "Redis helper port 16379 is already in use; using $redis_host_port"
+    fi
   fi
 
   local auth_secret signing_kek session_secret
@@ -1534,7 +1627,7 @@ generate_compose() {
   fi
 
   local hc_cmd
-  hc_cmd="[\"CMD\", \"sh\", \"-c\", \"curl -sf http://localhost:${DETECTED_PORT}/ > /dev/null || wget -qO- http://localhost:${DETECTED_PORT}/ > /dev/null || exit 1\"]"
+  hc_cmd="[\"CMD\", \"sh\", \"-c\", \"curl -sf http://localhost:${app_port}/ > /dev/null || wget -qO- http://localhost:${app_port}/ > /dev/null || exit 1\"]"
 
   {
     cat <<COMPHEAD
@@ -1556,6 +1649,12 @@ COMPHEAD
       POSTGRES_DB: app_db
     volumes:
       - ${container_name}-pgdata:/var/lib/postgresql/data
+PGSVC
+      if [[ "$use_host_network" -eq 1 ]]; then
+        echo "    ports:"
+        echo "      - \"127.0.0.1:${pg_host_port}:5432\""
+      fi
+      cat <<PGSVC
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app_user -d app_db"]
       interval: 10s
@@ -1573,6 +1672,12 @@ PGSVC
     restart: unless-stopped
     volumes:
       - ${container_name}-redisdata:/data
+REDISSVC
+      if [[ "$use_host_network" -eq 1 ]]; then
+        echo "    ports:"
+        echo "      - \"127.0.0.1:${redis_host_port}:6379\""
+      fi
+      cat <<REDISSVC
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -1592,10 +1697,40 @@ REDISSVC
     env_file: ./${repo_dir}/.env
 COMPHEAD
 
+    if [[ "$use_host_network" -eq 1 ]]; then
+      echo "    network_mode: host"
+    fi
+
     echo "    environment:"
-    echo "      PORT: \"${DETECTED_PORT}\""
+    echo "      PORT: \"${app_port}\""
+    local runtime_key runtime_value runtime_out
+    for runtime_key in \
+      OMNIUS_BASE_URL OA_BASE_URL LLM_BASE_URL \
+      OMNIUS_CHAT_MODEL OA_CHAT_MODEL LLM_MODEL \
+      OMNIUS_TOOL_MODEL OA_TOOL_MODEL \
+      OMNIUS_EMBED_MODEL OA_EMBED_MODEL
+    do
+      runtime_value="$(env_var_value "$runtime_key" 2>/dev/null || true)"
+      [[ -z "$runtime_value" ]] && continue
+      runtime_out="$runtime_value"
+      if [[ "$use_host_network" -eq 0 && "$runtime_key" == *"_BASE_URL" ]] && is_loopback_url "$runtime_value"; then
+        runtime_out="$(docker_host_url "$runtime_value")"
+        needs_host_gateway=1
+      fi
+      echo "      ${runtime_key}: $(yaml_quote "$runtime_out")"
+    done
     if [[ "$needs_postgres" -eq 1 ]]; then
-      cat <<APPDBENV
+      if [[ "$use_host_network" -eq 1 ]]; then
+        cat <<APPDBENV
+      DATABASE_URL: postgresql://app_user:app_password@127.0.0.1:${pg_host_port}/app_db
+      PGHOST: 127.0.0.1
+      PGPORT: "${pg_host_port}"
+      PGDATABASE: app_db
+      PGUSER: app_user
+      PGPASSWORD: app_password
+APPDBENV
+      else
+        cat <<APPDBENV
       DATABASE_URL: postgresql://app_user:app_password@postgres:5432/app_db
       PGHOST: postgres
       PGPORT: "5432"
@@ -1603,9 +1738,14 @@ COMPHEAD
       PGUSER: app_user
       PGPASSWORD: app_password
 APPDBENV
+      fi
     fi
     if [[ "$needs_redis" -eq 1 ]]; then
-      echo "      REDIS_URL: redis://redis:6379"
+      if [[ "$use_host_network" -eq 1 ]]; then
+        echo "      REDIS_URL: redis://127.0.0.1:${redis_host_port}"
+      else
+        echo "      REDIS_URL: redis://redis:6379"
+      fi
     fi
     if [[ "$skip_local_services" -eq 1 ]]; then
       echo "      SKIP_LOCAL_SERVICES: \"1\""
@@ -1618,6 +1758,11 @@ APPDBENV
     fi
     if [[ -n "$session_secret" ]]; then
       echo "      SESSION_SECRET: $session_secret"
+    fi
+
+    if [[ "$needs_host_gateway" -eq 1 ]]; then
+      echo "    extra_hosts:"
+      echo "      - \"host.docker.internal:host-gateway\""
     fi
 
     if [[ "$needs_postgres" -eq 1 || "$needs_redis" -eq 1 ]]; then
@@ -1671,6 +1816,13 @@ COMPHC
       echo -e "$volume_def" | sed '/^$/d'
     fi
   } > "$outfile"
+
+  mkdir -p "$VOX_DIR" 2>/dev/null || true
+  {
+    echo "app=${app_port}"
+    [[ "$needs_postgres" -eq 1 && "$use_host_network" -eq 1 ]] && echo "postgres=${pg_host_port}"
+    [[ "$needs_redis" -eq 1 && "$use_host_network" -eq 1 ]] && echo "redis=${redis_host_port}"
+  } > "$VOX_DIR/ports"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2362,6 +2514,10 @@ PATCHEOF
 
   # ── docker-compose.yml ──
   COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
+  if [[ -f "$COMPOSE_FILE" ]]; then
+    info "Releasing previous vox containers before regenerating compose"
+    compose_release_project_resources
+  fi
   info "Writing $COMPOSE_FILE"
   generate_compose "$COMPOSE_FILE" "$REPO_DIR"
 
@@ -2677,18 +2833,8 @@ cmd_restart() {
   vox_load_config
   WORK_DIR="$(pwd)"
   cd "$WORK_DIR"
-  info "Restarting services (streaming output below)"
-  stream_open "docker compose restart"
-  set +e
-  $COMPOSE_CMD restart 2>&1
-  local rc=$?
-  set -e
-  if [[ "$rc" -eq 0 ]]; then
-    stream_close "restart ok" "$GREEN"
-  else
-    stream_close "restart FAILED (exit $rc)" "$RED"
-  fi
-  return "$rc"
+  compose_down
+  compose_up
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
