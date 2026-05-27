@@ -574,12 +574,12 @@ detect_project() {
   # ── Node.js ──
   if [[ -f "$repo/package.json" ]]; then
     DETECTED_TYPE="node"
-    DETECTED_BASE_IMAGE="node:20-alpine"
+    DETECTED_BASE_IMAGE="node:22-slim"
     # If repo has Python files (transcription sidecar, ML, etc.), use Debian slim
     # Alpine's musl breaks numpy/scipy/whisper pip wheels
     if compgen -G "$repo/*.py" > /dev/null 2>&1 || [[ -f "$repo/requirements.txt" ]] || [[ -f "$repo/Pipfile" ]]; then
-      DETECTED_BASE_IMAGE="node:20-slim"
-      detect "Python files detected — using node:20-slim (glibc) instead of alpine (musl)"
+      DETECTED_BASE_IMAGE="node:22-slim"
+      detect "Python files detected — using node:22-slim (glibc) instead of alpine (musl)"
     fi
     DETECTED_COPY_DEPS="package.json package-lock.json* yarn.lock* pnpm-lock.yaml*"
     DETECTED_IGNORE_PATTERNS="node_modules\n.next\n.nuxt\ndist\nbuild\n.env.local\n.git"
@@ -591,7 +591,7 @@ detect_project() {
     local pkg_mgr="npm"
     if [[ -f "$repo/pnpm-lock.yaml" ]]; then
       pkg_mgr="pnpm"
-      DETECTED_BASE_IMAGE="node:20-alpine"
+      DETECTED_BASE_IMAGE="node:22-slim"
       DETECTED_SYSTEM_DEPS="RUN corepack enable && corepack prepare pnpm@latest --activate"
     elif [[ -f "$repo/yarn.lock" ]]; then
       pkg_mgr="yarn"
@@ -628,8 +628,16 @@ print(f'main:{d.get(\"main\", \"\")}')
     case "$pkg_mgr" in
       pnpm) DETECTED_INSTALL_CMD="pnpm install --frozen-lockfile --ignore-scripts" ;;
       yarn) DETECTED_INSTALL_CMD="yarn install --frozen-lockfile --ignore-scripts" ;;
-      *)    DETECTED_INSTALL_CMD="npm ci --ignore-scripts" ;;
+      *)    DETECTED_INSTALL_CMD="npm ci --ignore-scripts --legacy-peer-deps" ;;
     esac
+
+    if echo "$DETECTED_BASE_IMAGE" | grep -q "slim\|debian\|ubuntu"; then
+      DETECTED_SYSTEM_DEPS="${DETECTED_SYSTEM_DEPS:+$DETECTED_SYSTEM_DEPS\n}RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl postgresql-client && rm -rf /var/lib/apt/lists/*"
+      detect "Node runtime uses Debian slim — adding bash, curl, CA certs, and psql"
+    elif echo "$DETECTED_BASE_IMAGE" | grep -q "alpine"; then
+      DETECTED_SYSTEM_DEPS="${DETECTED_SYSTEM_DEPS:+$DETECTED_SYSTEM_DEPS\n}RUN apk add --no-cache bash ca-certificates curl postgresql-client"
+      detect "Node runtime uses Alpine — adding bash, curl, CA certs, and psql"
+    fi
 
     # Check for native modules that need build tools
     local has_native=0
@@ -1218,6 +1226,7 @@ trap cleanup TERM INT
 # ── Ensure app binds to 0.0.0.0 (reachable by tunnel within container) ──
 export HOSTNAME="${HOSTNAME_OVERRIDE:-0.0.0.0}"
 export HOST="${HOST:-0.0.0.0}"
+export PORT="${PORT:-__VOX_PORT__}"
 
 # ── Start cloudflared tunnel inside the container ──
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
@@ -1237,6 +1246,7 @@ fi
 ENTRYEOF
 
   # Write the app start command
+  sed -i "s/__VOX_PORT__/${port}/g" "$outfile"
   cat >> "$outfile" <<STARTEOF
 echo "[vox] starting app on port ${port}..."
 ${start_cmd} &
@@ -1425,12 +1435,87 @@ RUSTEOF
 # DOCKER-COMPOSE GENERATOR
 # ═════════════════════════════════════════════════════════════════════════════
 
+env_var_value() {
+  local key="$1" entry
+  for entry in "${ENV_VARS[@]+"${ENV_VARS[@]}"}"; do
+    if [[ "$entry" == "$key="* ]]; then
+      printf '%s\n' "${entry#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+env_var_has_usable_value() {
+  local value
+  value="$(env_var_value "$1" 2>/dev/null || true)"
+  [[ -n "$value" ]] && ! echo "$value" | grep -qiE '^replace-with|changeme|change-me|your-|todo|example'
+}
+
+env_vars_upsert() {
+  local key="$1" value="$2" idx updated=0
+  for idx in "${!ENV_VARS[@]}"; do
+    if [[ "${ENV_VARS[$idx]}" == "$key="* ]]; then
+      ENV_VARS[$idx]="$key=$value"
+      updated=1
+    fi
+  done
+  if [[ "$updated" -eq 0 ]]; then
+    ENV_VARS+=("$key=$value")
+  fi
+}
+
+ensure_generated_secret() {
+  local key="$1" bytes="${2:-32}"
+  if ! env_var_has_usable_value "$key"; then
+    env_vars_upsert "$key" "$(random_hex "$bytes")"
+    detect "Generated stable $key for container runtime"
+  fi
+}
+
+random_hex() {
+  local bytes="${1:-32}"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$bytes"
+  else
+    LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c $((bytes * 2))
+    echo ""
+  fi
+}
+
 generate_compose() {
   local outfile="$1" repo_dir="$2"
   local container_name
   container_name=$(echo "$repo_dir" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-*$//')
 
-  # ── Single container: app + cloudflared tunnel, fully isolated ──
+  # ── App + cloudflared tunnel, with optional managed backing services ──
+  local needs_postgres=0 needs_redis=0 skip_local_services=0
+  local repo_path="$WORK_DIR/$repo_dir"
+  local pkg="$repo_path/package.json"
+
+  if env_var_value "DATABASE_URL" >/dev/null 2>&1 || env_var_value "PGHOST" >/dev/null 2>&1; then
+    needs_postgres=1
+  elif [[ -f "$pkg" ]] && grep -qE '"(db:migrate|db:apply|db:ensure|db:push)"|drizzle|@neondatabase/serverless|"pg"' "$pkg"; then
+    needs_postgres=1
+  fi
+
+  if env_var_value "REDIS_URL" >/dev/null 2>&1 || env_var_value "MCP_SESSION_REDIS_URL" >/dev/null 2>&1; then
+    needs_redis=1
+  elif [[ -f "$pkg" ]] && grep -qE '"redis"|"rate-limit-redis"' "$pkg"; then
+    needs_redis=1
+  fi
+
+  if [[ -f "$repo_path/scripts/ensure-services.sh" ]] || { [[ -f "$pkg" ]] && grep -q "services:ensure" "$pkg"; }; then
+    skip_local_services=1
+  fi
+
+  local auth_secret signing_kek session_secret
+  auth_secret="$(env_var_value "AUTH_JWT_SECRET" 2>/dev/null || true)"
+  signing_kek="$(env_var_value "SIGNING_KEK_HEX" 2>/dev/null || true)"
+  session_secret="$(env_var_value "SESSION_SECRET" 2>/dev/null || true)"
+  env_var_has_usable_value "AUTH_JWT_SECRET" || auth_secret="$(random_hex 32)"
+  env_var_has_usable_value "SIGNING_KEK_HEX" || signing_kek="$(random_hex 32)"
+  env_var_has_usable_value "SESSION_SECRET" || session_secret="$(random_hex 32)"
 
   local volume_block=""
   local volume_def=""
@@ -1440,6 +1525,12 @@ generate_compose() {
       volume_block="${volume_block}      - ${vol_name}:/app/${ddir}\n"
       volume_def="${volume_def}  ${vol_name}:\n"
     done
+  fi
+  if [[ "$needs_postgres" -eq 1 ]]; then
+    volume_def="${volume_def}  ${container_name}-pgdata:\n"
+  fi
+  if [[ "$needs_redis" -eq 1 ]]; then
+    volume_def="${volume_def}  ${container_name}-redisdata:\n"
   fi
 
   local hc_cmd
@@ -1451,6 +1542,47 @@ generate_compose() {
 # Single container: app + cloudflared tunnel (fully isolated from host)
 
 services:
+COMPHEAD
+
+    if [[ "$needs_postgres" -eq 1 ]]; then
+      cat <<PGSVC
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${container_name}-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: app_password
+      POSTGRES_DB: app_db
+    volumes:
+      - ${container_name}-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d app_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+PGSVC
+    fi
+
+    if [[ "$needs_redis" -eq 1 ]]; then
+      cat <<REDISSVC
+  redis:
+    image: redis:7-alpine
+    container_name: ${container_name}-redis
+    restart: unless-stopped
+    volumes:
+      - ${container_name}-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+REDISSVC
+    fi
+
+    cat <<COMPHEAD
   ${container_name}:
     build:
       context: ./${repo_dir}
@@ -1459,6 +1591,46 @@ services:
     restart: unless-stopped
     env_file: ./${repo_dir}/.env
 COMPHEAD
+
+    echo "    environment:"
+    echo "      PORT: \"${DETECTED_PORT}\""
+    if [[ "$needs_postgres" -eq 1 ]]; then
+      cat <<APPDBENV
+      DATABASE_URL: postgresql://app_user:app_password@postgres:5432/app_db
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: app_db
+      PGUSER: app_user
+      PGPASSWORD: app_password
+APPDBENV
+    fi
+    if [[ "$needs_redis" -eq 1 ]]; then
+      echo "      REDIS_URL: redis://redis:6379"
+    fi
+    if [[ "$skip_local_services" -eq 1 ]]; then
+      echo "      SKIP_LOCAL_SERVICES: \"1\""
+    fi
+    if [[ -n "$auth_secret" ]]; then
+      echo "      AUTH_JWT_SECRET: $auth_secret"
+    fi
+    if [[ -n "$signing_kek" ]]; then
+      echo "      SIGNING_KEK_HEX: $signing_kek"
+    fi
+    if [[ -n "$session_secret" ]]; then
+      echo "      SESSION_SECRET: $session_secret"
+    fi
+
+    if [[ "$needs_postgres" -eq 1 || "$needs_redis" -eq 1 ]]; then
+      echo "    depends_on:"
+      if [[ "$needs_postgres" -eq 1 ]]; then
+        echo "      postgres:"
+        echo "        condition: service_healthy"
+      fi
+      if [[ "$needs_redis" -eq 1 ]]; then
+        echo "      redis:"
+        echo "        condition: service_healthy"
+      fi
+    fi
 
     # Volumes
     if [[ -n "$volume_block" ]]; then
@@ -2025,7 +2197,7 @@ cmd_setup() {
         DETECTED_PORT="${local_port:-3000}"
         ask DETECTED_PORT "Port" "$DETECTED_PORT"
       else
-        ask DETECTED_BASE_IMAGE  "Base Docker image (e.g. node:20-alpine, python:3.12-slim)" ""
+        ask DETECTED_BASE_IMAGE  "Base Docker image (e.g. node:22-slim, python:3.12-slim)" ""
         ask DETECTED_INSTALL_CMD "Dependency install command (e.g. npm ci, pip install -r requirements.txt)" ""
         ask DETECTED_BUILD_CMD   "Build command (blank if none)" ""
         ask DETECTED_START_CMD   "Start command (e.g. npm start, python app.py)" ""
@@ -2035,7 +2207,7 @@ cmd_setup() {
       fi
     else
       box_line "Common base images:"
-      box_line "  node:20-alpine  | python:3.12-slim | golang:1.22-alpine"
+      box_line "  node:22-slim    | python:3.12-slim | golang:1.22-alpine"
       box_line "  ruby:3.3-slim   | php:8.3-apache   | nginx:alpine"
       box_render
       echo ""
@@ -2116,6 +2288,15 @@ cmd_setup() {
   # ─────────────────────────────────────────────────────────────────────────
   banner "Step 5 / 5 — Generate & Deploy"
 
+  # Production-oriented Node apps commonly require these at boot. Generate
+  # stable values into the env file when the imported env is missing or still
+  # contains template placeholders.
+  if [[ "$DETECTED_TYPE" == node* ]]; then
+    ensure_generated_secret "AUTH_JWT_SECRET" 32
+    ensure_generated_secret "SIGNING_KEK_HEX" 32
+    ensure_generated_secret "SESSION_SECRET" 32
+  fi
+
   # ── .env → inside repo dir ──
   ENV_FILE="$REPO_PATH/.env"
   info "Writing $ENV_FILE"
@@ -2154,7 +2335,7 @@ cmd_setup() {
         cat >> "$REPO_PATH/Dockerfile" <<'PATCHEOF'
 
 # --- vox: cloudflared + GPU support injected ---
-RUN apk add --no-cache curl 2>/dev/null || (apt-get update && apt-get install -y --no-install-recommends curl) ; \
+RUN (apk add --no-cache bash ca-certificates curl postgresql-client 2>/dev/null || (apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl postgresql-client && rm -rf /var/lib/apt/lists/*)) ; \
     curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
     chmod +x /usr/local/bin/cloudflared
 COPY entrypoint.sh /entrypoint.sh
