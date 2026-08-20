@@ -137,13 +137,107 @@ _ensure_log_dir() {
   echo "$d"
 }
 
+# Load optional, operator-controlled Docker build arguments. The hook lives in
+# deployment state rather than the pulled application repository, so a remote
+# commit cannot gain host-code execution merely by adding a hook file.
+#
+# Hook: .vox/build-args (override with VOX_BUILD_ARGS_HOOK)
+# Output: one NAME=value pair per line; blank lines and comments are ignored.
+# Values are passed directly to `docker compose build --build-arg` and are never
+# printed by vox. Build args are visible in image metadata/history, so hooks
+# must not emit secrets.
+declare -a VOX_PROJECT_BUILD_ARGS=()
+
+vox_load_build_args() {
+  VOX_PROJECT_BUILD_ARGS=()
+
+  local work_dir="${WORK_DIR:-$(pwd)}"
+  local repo_path="${REPO_PATH:-}"
+  local hook_path="${VOX_BUILD_ARGS_HOOK:-$work_dir/${VOX_DIR:-.vox}/build-args}"
+
+  if [[ "$hook_path" != /* ]]; then
+    hook_path="$work_dir/$hook_path"
+  fi
+  [[ -e "$hook_path" ]] || return 0
+
+  if [[ ! -f "$hook_path" ]] || [[ ! -x "$hook_path" ]]; then
+    err "Build-args hook must be an executable file: $hook_path"
+    return 78
+  fi
+  if [[ -z "$repo_path" ]] || [[ ! -d "$repo_path" ]]; then
+    err "Build-args hook requires a valid deployment repository path."
+    return 78
+  fi
+
+  local git_sha=""
+  local git_sha_short=""
+  local git_commit_count=""
+  local git_branch=""
+  if git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_sha=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || true)
+    git_sha_short=$(git -C "$repo_path" rev-parse --short HEAD 2>/dev/null || true)
+    git_commit_count=$(git -C "$repo_path" rev-list --count HEAD 2>/dev/null || true)
+    git_branch=$(git -C "$repo_path" branch --show-current 2>/dev/null || true)
+  fi
+
+  local hook_output
+  if ! hook_output=$(
+    cd "$repo_path" && \
+      VOX_REPO_PATH="$repo_path" \
+      VOX_GIT_SHA="$git_sha" \
+      VOX_GIT_SHA_SHORT="$git_sha_short" \
+      VOX_GIT_COMMIT_COUNT="$git_commit_count" \
+      VOX_GIT_BRANCH="$git_branch" \
+      "$hook_path"
+  ); then
+    err "Build-args hook failed: $hook_path"
+    return 78
+  fi
+
+  local line key value
+  local -a build_arg_names=()
+  declare -A seen_build_args=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" != *=* ]]; then
+      err "Invalid build-args hook output (expected NAME=value): $line"
+      return 78
+    fi
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      err "Invalid Docker build-arg name from hook: $key"
+      return 78
+    fi
+    if [[ -n "${seen_build_args[$key]:-}" ]]; then
+      err "Duplicate Docker build-arg name from hook: $key"
+      return 78
+    fi
+    seen_build_args["$key"]=1
+    build_arg_names+=("$key")
+    VOX_PROJECT_BUILD_ARGS+=(--build-arg "$key=$value")
+  done <<< "$hook_output"
+
+  if (( ${#build_arg_names[@]} > 0 )); then
+    info "Loaded ${#build_arg_names[@]} Docker build arg(s) from $hook_path: ${build_arg_names[*]}"
+  fi
+}
+
 # compose_build [extra-args...] — run `docker compose build` with streaming
 # output, a mirrored log file, and a proper exit code.
 compose_build() {
   local log_dir build_log progress_flag
+  local -a build_args=("$@")
   log_dir=$(_ensure_log_dir)
   build_log="$log_dir/build.log"
   progress_flag=$(_compose_progress_flag)
+
+  if ! vox_load_build_args; then
+    return 78
+  fi
+  build_args+=("${VOX_PROJECT_BUILD_ARGS[@]}")
 
   info "Building container image (streaming output below, log: $build_log)"
   stream_open "docker compose build"
@@ -153,9 +247,9 @@ compose_build() {
   # PIPESTATUS → return the real build exit code, not tee's
   set +e
   if [[ -n "$progress_flag" ]]; then
-    $COMPOSE_CMD build $progress_flag "$@" 2>&1 | tee "$build_log"
+    $COMPOSE_CMD build "$progress_flag" "${build_args[@]}" 2>&1 | tee "$build_log"
   else
-    $COMPOSE_CMD build "$@" 2>&1 | tee "$build_log"
+    $COMPOSE_CMD build "${build_args[@]}" 2>&1 | tee "$build_log"
   fi
   local rc=${PIPESTATUS[0]}
   set -e

@@ -59,6 +59,40 @@ With env file and custom branch:
 
 *When all three required flags are provided, setup runs fully non-interactive — no prompts, straight to build and deploy.
 
+## Custom Docker Build Arguments
+
+Some applications need deployment metadata at image-build time, but the
+meaning and naming of that metadata belongs to the application, not to `vox`.
+Create an executable `.vox/build-args` hook in the deployment directory to
+emit the arguments your Dockerfile declares:
+
+```bash
+#!/usr/bin/env bash
+printf 'BUILD_GIT_SHA=%s\n' "$VOX_GIT_SHA_SHORT"
+printf 'BUILD_GIT_COMMIT_COUNT=%s\n' "$VOX_GIT_COMMIT_COUNT"
+```
+
+```bash
+chmod +x .vox/build-args
+```
+
+Each non-comment output line must be `NAME=value`. `vox` validates the names,
+passes the pairs to `docker compose build --build-arg`, and logs only the names.
+The hook runs with the application repository as its working directory and
+receives these environment variables:
+
+- `VOX_REPO_PATH`
+- `VOX_GIT_SHA`
+- `VOX_GIT_SHA_SHORT`
+- `VOX_GIT_COMMIT_COUNT`
+- `VOX_GIT_BRANCH`
+
+Set `VOX_BUILD_ARGS_HOOK` to use a different operator-controlled hook path.
+The default hook is kept in `.vox`, outside the pulled repository, so a remote
+commit cannot introduce host-side hook execution. Build arguments are not a
+safe channel for secrets; use runtime environment variables or Docker secrets
+for credentials.
+
 ## How It Works
 
 Each project runs in a **single Docker container** that contains:
